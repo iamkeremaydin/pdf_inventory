@@ -615,7 +615,8 @@ def scan_folder(root_path: Path, cancel_event: threading.Event, emit: Callable[[
         for group in size_groups.values():
             first_path_by_id: dict[Any, str] = {}
             distinct: list[dict[str, Any]] = []
-            for path in group:
+            # Inspection finishes in thread order; sort so the same link is "first" on every run.
+            for path in sorted(group, key=str.casefold):
                 record = inspected[path]
                 file_id = record["file_id"]
                 if file_id is not None and file_id in first_path_by_id:
@@ -684,7 +685,9 @@ def scan_folder(root_path: Path, cancel_event: threading.Event, emit: Callable[[
                     groups[path] = number
 
         for path, first_path in hard_link_of.items():
-            states[path] = states.get(first_path, False)
+            # Report every name of a hard-linked file, including the first one.
+            states.setdefault(first_path, False)
+            states[path] = states[first_path]
             if first_path in groups:
                 groups[path] = groups[first_path]
         emit("duplicates", {"states": states, "groups": groups})

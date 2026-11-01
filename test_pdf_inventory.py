@@ -69,6 +69,12 @@ def final_records(events: list) -> dict:
     return records
 
 
+def destroy_root(root: tk.Tk) -> None:
+    """Let pending idle events such as ttk's theme change run before the interpreter goes away."""
+    root.update()
+    root.destroy()
+
+
 class EntryWithoutJunctionCheck:
     """Mimic os.DirEntry on Python 3.10 and 3.11, which have no is_junction()."""
 
@@ -303,8 +309,8 @@ class ScanCorrectnessTest(unittest.TestCase):
 
             states = final_duplicates(run_scan(root))["states"]
 
-            self.assertFalse(states.get(str(original), False))
-            self.assertFalse(states[str(root / "b.pdf")])
+            self.assertEqual({Path(path).name: state for path, state in states.items()},
+                             {"a.pdf": False, "b.pdf": False})
 
     def test_hard_link_of_a_duplicated_file_is_also_a_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -535,7 +541,7 @@ class AppTestCase(unittest.TestCase):
         except tk.TclError as exc:
             self.skipTest(f"Tk is not available: {exc}")
         self.root.withdraw()
-        self.addCleanup(self.root.destroy)
+        self.addCleanup(destroy_root, self.root)
         self.app = inv.PDFInventoryApp(self.root)
         self.app.current_lang = "en"
         self.app._update_language()
@@ -707,7 +713,7 @@ class AppTest(AppTestCase):
         settings.write_text(json.dumps({"target_directory": str(self.library)}), encoding="utf-8")
         root = tk.Tk()
         root.withdraw()
-        self.addCleanup(root.destroy)
+        self.addCleanup(destroy_root, root)
         app = inv.PDFInventoryApp(root)
 
         self.assertEqual(app.target_directory, str(Path(inv.__file__).resolve().parent))
@@ -721,7 +727,7 @@ class AppTest(AppTestCase):
         (self.data_dir / "settings.json").write_text('{"geometry": "1180x760+-9000+-9000"}', encoding="utf-8")
         root = tk.Tk()
         root.withdraw()
-        self.addCleanup(root.destroy)
+        self.addCleanup(destroy_root, root)
         inv.PDFInventoryApp(root)
         root.update_idletasks()
 
