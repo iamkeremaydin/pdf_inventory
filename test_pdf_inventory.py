@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import os
 import tempfile
 import threading
@@ -680,6 +681,21 @@ class AppTest(AppTestCase):
         self.assertIn("Problem", header)
         self.assertEqual(header[-1], "Size (bytes)")
         self.assertEqual(row[-1], "5")
+
+    def test_each_launch_starts_in_the_program_folder_not_the_last_one(self):
+        settings = self.data_dir / "settings.json"
+        settings.write_text(json.dumps({"target_directory": str(self.library)}), encoding="utf-8")
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        app = inv.PDFInventoryApp(root)
+
+        self.assertEqual(app.target_directory, str(Path(inv.__file__).resolve().parent))
+        with mock.patch.object(inv.filedialog, "askdirectory", return_value=str(self.library)):
+            app._select_folder()
+        self.assertEqual(app.target_directory, os.path.normpath(str(self.library)))
+        app._save_settings()
+        self.assertNotIn("target_directory", json.loads(settings.read_text(encoding="utf-8")))
 
     def test_off_screen_saved_position_is_replaced(self):
         (self.data_dir / "settings.json").write_text('{"geometry": "1180x760+-9000+-9000"}', encoding="utf-8")

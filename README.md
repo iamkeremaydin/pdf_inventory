@@ -24,7 +24,7 @@ The app does not require a build step.
 
 ## Scanning a folder
 
-Choose a folder with **Browse…** (or **File → Select folder…**) and press **Start scan**. Every subfolder is scanned.
+The app always starts with the folder that contains `pdf_inventory.py` as the target, so you can copy it into a PDF library and start it there. To scan somewhere else, choose a folder with **Browse…** (or **File → Select folder…**); that choice lasts until the app closes. Press **Start scan** to scan the folder and every subfolder.
 
 - **Duplicates** are found by size, then a quick partial hash, then a full SHA-256 comparison. Copies of the same file share a group number ("Yes · group 2"), so sorting by the Duplicate column puts each file next to its copies. The status line shows how much space removing the extra copies would free. Hard links count as one file.
 - **Problem** explains why a row is marked Corrupted, Encrypted or Unreadable, using the PDF library's own message. A PDF that takes longer than two minutes to read is reported as unreadable instead of stalling the scan.
@@ -47,7 +47,7 @@ Only names change; file contents are never opened for writing. Every run saves a
 
 All in the per-user application folder: `%APPDATA%\PDFMasterSuite` on Windows, `~/Library/Application Support/PDFMasterSuite` on macOS, and `~/.config/PDFMasterSuite` on Linux.
 
-- `settings.json`: language, last folder, CSV separator and window position. A window position that is no longer on any screen is ignored.
+- `settings.json`: language, CSV separator, last export folder and window position. A window position that is no longer on any screen is ignored.
 - `rename_reports/`: one CSV report per filename cleanup or undo.
 - `pdf_inventory.log`: warnings and errors, kept small by rotation.
 

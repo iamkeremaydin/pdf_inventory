@@ -954,8 +954,9 @@ class PDFInventoryApp:
         self.settings = self._load_settings()
         saved_lang = self.settings.get("language")
         self.current_lang = saved_lang if saved_lang in TRANSLATIONS else self._get_system_language()
-        saved_dir = self.settings.get("target_directory")
-        self.target_directory = str(Path(saved_dir).expanduser()) if saved_dir and Path(saved_dir).expanduser().is_dir() else self._get_base_directory()
+        # Every launch starts in the folder the program is in, so copying it into a library and
+        # starting it there scans that library. Browse… changes the folder for this session only.
+        self.target_directory = self._get_base_directory()
         self.csv_separator = self.settings.get("csv_separator", "auto")
         if self.csv_separator not in {"auto", "comma", "semicolon", "tab"}:
             self.csv_separator = "auto"
@@ -1014,7 +1015,6 @@ class PDFInventoryApp:
     def _save_settings(self) -> None:
         payload = {
             "language": self.current_lang,
-            "target_directory": self.target_directory,
             "csv_separator": self.csv_separator,
             "last_export_dir": self.last_export_dir,
             "geometry": self.root.geometry(),
@@ -1346,7 +1346,6 @@ class PDFInventoryApp:
         if selected:
             self.target_directory = os.path.normpath(selected)
             self.path_var.set(self.target_directory)
-            self._save_settings()
             self._set_status("status_ready")
 
     def _start_scan(self) -> None:
