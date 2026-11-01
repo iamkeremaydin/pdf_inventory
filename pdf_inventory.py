@@ -19,7 +19,7 @@ from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Sequence
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -84,11 +84,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "page_encrypted": "Encrypted",
         "page_unavailable": "Unavailable",
         "page_unreadable": "Unreadable",
-        "msg_info": "Information",
         "msg_warning": "Warning",
         "msg_error": "Error",
         "msg_no_data": "There are no visible rows to export.",
-        "msg_export_success": "CSV file saved successfully.",
         "msg_export_error": "The CSV file could not be saved:\n{error}",
         "msg_folder_error": "The folder could not be opened:\n{error}",
         "msg_file_error": "The file could not be opened:\n{error}",
@@ -147,11 +145,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "page_encrypted": "Şifreli",
         "page_unavailable": "Kullanılamıyor",
         "page_unreadable": "Okunamadı",
-        "msg_info": "Bilgi",
         "msg_warning": "Uyarı",
         "msg_error": "Hata",
         "msg_no_data": "Dışa aktarılacak görünür satır yok.",
-        "msg_export_success": "CSV dosyası başarıyla kaydedildi.",
         "msg_export_error": "CSV dosyası kaydedilemedi:\n{error}",
         "msg_folder_error": "Klasör açılamadı:\n{error}",
         "msg_file_error": "Dosya açılamadı:\n{error}",
@@ -215,6 +211,32 @@ def sanitize_csv_cell(value: Any) -> Any:
     if stripped.startswith(("=", "+", "-", "@")):
         return "'" + value
     return value
+
+
+def write_csv_export(destination: Path, headers: Sequence[Any], rows: Iterable[Sequence[Any]],
+                     delimiter: str) -> None:
+    """Write an export atomically without materializing all rows in memory."""
+    temp_name: str | None = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8-sig", errors="replace", newline="", delete=False,
+                                         dir=destination.parent, suffix=".tmp") as stream:
+            temp_name = stream.name
+            writer = csv.writer(stream, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+            writer.writerow([sanitize_csv_cell(item) for item in headers])
+            for row in rows:
+                writer.writerow([sanitize_csv_cell(item) for item in row])
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, destination)
+        temp_name = None
+    except (OSError, csv.Error, UnicodeError):
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+        raise
 
 
 def _quick_hash(path: Path, expected_size: int, expected_mtime_ns: int | None = None) -> str | None:
@@ -1295,33 +1317,13 @@ class PDFInventoryApp:
 
         headers = [self._t("col_" + key) for key in self.columns]
         delimiter = resolve_csv_delimiter(self.csv_separator, self.current_lang)
-        output_rows = [self._row_values(record) for record in visible_records]
         destination = Path(save_path)
-        temp_name: str | None = None
         try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8-sig", errors="replace", newline="", delete=False,
-                                             dir=destination.parent, suffix=".tmp") as stream:
-                temp_name = stream.name
-                writer = csv.writer(stream, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL,
-                                    lineterminator="\r\n")
-                writer.writerow([sanitize_csv_cell(item) for item in headers])
-                for row in output_rows:
-                    writer.writerow([sanitize_csv_cell(item) for item in row])
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temp_name, destination)
-            temp_name = None
+            write_csv_export(destination, headers, (self._row_values(record) for record in visible_records), delimiter)
             self.last_export_dir = str(destination.parent)
             self._save_settings()
-            self._set_status("status_exported", count=len(output_rows), path=str(destination))
-            messagebox.showinfo(self._t("msg_info"), self._t("msg_export_success"))
+            self._set_status("status_exported", count=len(visible_records), path=str(destination))
         except (OSError, csv.Error, UnicodeError) as exc:
-            if temp_name:
-                try:
-                    os.unlink(temp_name)
-                except OSError:
-                    pass
             messagebox.showerror(self._t("msg_error"), self._t("msg_export_error", error=exc))
 
     # ---------- Lifecycle ----------

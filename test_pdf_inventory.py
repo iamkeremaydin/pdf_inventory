@@ -1,3 +1,4 @@
+import csv
 import tempfile
 import threading
 import unittest
@@ -12,6 +13,7 @@ from pdf_inventory import (
     normalize_search,
     resolve_csv_delimiter,
     sanitize_csv_cell,
+    write_csv_export,
 )
 
 
@@ -52,6 +54,22 @@ class InventoryHelpersTest(unittest.TestCase):
 
         for language in ("en", "tr"):
             self.assertTrue(TRANSLATIONS[language]["msg_invalid_folder"])
+
+    def test_csv_export_streams_sanitized_rows_to_the_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "export.csv"
+            write_csv_export(
+                destination,
+                ("Name", "Path"),
+                (("=formula", "/first.pdf"), ("plain", "/second.pdf")),
+                ",",
+            )
+
+            with destination.open("r", encoding="utf-8-sig", newline="") as stream:
+                self.assertEqual(
+                    list(csv.reader(stream)),
+                    [["Name", "Path"], ["'=formula", "/first.pdf"], ["plain", "/second.pdf"]],
+                )
 
 
 if __name__ == "__main__":

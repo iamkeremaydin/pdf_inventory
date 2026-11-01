@@ -25,6 +25,16 @@ The app is a local desktop utility. It does not collect analytics or send user d
 - **Rollback:** Revert the iteration commit.
 - **Review date:** After the first large-folder scan by a user.
 
+### Iteration 2 — low-friction, memory-safe export
+
+- **Owner:** Repository maintainer.
+- **Reason:** Successful export required dismissing an extra dialog, and large exports duplicated all formatted rows in memory.
+- **Change:** Keep success feedback in the status bar and stream sanitized rows through the existing atomic writer.
+- **Acceptance:** Export success requires no extra click; the CSV content and formula protection remain intact.
+- **Verify:** `python -m unittest -v`; export filtered results and open the CSV in a spreadsheet.
+- **Rollback:** Revert the iteration commit.
+- **Review date:** After the next user export of a large inventory.
+
 ## Backlog
 
 | Priority | Hypothesis | Owner | Success metric | Effort | Risk | Decision |
