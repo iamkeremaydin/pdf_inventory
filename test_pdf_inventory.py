@@ -147,6 +147,26 @@ class InventoryHelpersTest(unittest.TestCase):
         self.assertEqual(len(one_line("x" * 500)), 300)
 
 
+class PortableModeTest(unittest.TestCase):
+    def test_data_lives_next_to_the_script(self):
+        self.assertEqual(inv.app_data_dir(), Path(inv.__file__).resolve().parent / "pdf_inventory_data")
+
+    def test_data_lives_next_to_a_packaged_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "PDF Inventory.exe"
+            with mock.patch.object(inv.sys, "frozen", True, create=True), \
+                    mock.patch.object(inv.sys, "executable", str(executable)):
+                self.assertEqual(inv.program_dir(), executable.resolve().parent)
+                self.assertEqual(inv.app_data_dir(), executable.resolve().parent / "pdf_inventory_data")
+
+    def test_settings_reports_and_log_share_the_portable_folder(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(inv, "program_dir", lambda: Path(directory)):
+            data = Path(directory) / "pdf_inventory_data"
+            self.assertEqual(inv.PDFInventoryApp._settings_path(), data / "settings.json")
+            self.assertEqual(inv.log_file_path(), data / "pdf_inventory.log")
+
+
 class InspectionTest(unittest.TestCase):
     @unittest.skipUnless(inv.PYPDF_AVAILABLE, "pypdf is not installed")
     def test_page_count_and_corruption_reason(self):

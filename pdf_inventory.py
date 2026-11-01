@@ -884,15 +884,23 @@ def load_undo_plans(report_path: Path) -> tuple[list[RenamePlan], list[str]]:
 
 
 # ---------- Application files, logging and window placement ----------
+DATA_DIR_NAME = "pdf_inventory_data"
+
+
+def program_dir() -> Path:
+    """Folder that contains the program: the script, or the executable when packaged."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def app_data_dir() -> Path:
-    """Per-user folder for settings, rename reports and the log file."""
-    if sys.platform == "win32":
-        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support"
-    else:
-        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "PDFMasterSuite"
+    """Portable folder next to the program for settings, rename reports and the log file.
+
+    Nothing is written to per-user locations such as %APPDATA%, so each copy of the program
+    keeps its own data and can be moved together with it.
+    """
+    return program_dir() / DATA_DIR_NAME
 
 
 def log_file_path() -> Path:
@@ -956,7 +964,7 @@ class PDFInventoryApp:
         self.current_lang = saved_lang if saved_lang in TRANSLATIONS else self._get_system_language()
         # Every launch starts in the folder the program is in, so copying it into a library and
         # starting it there scans that library. Browse… changes the folder for this session only.
-        self.target_directory = self._get_base_directory()
+        self.target_directory = str(program_dir())
         self.csv_separator = self.settings.get("csv_separator", "auto")
         if self.csv_separator not in {"auto", "comma", "semicolon", "tab"}:
             self.csv_separator = "auto"
@@ -1041,12 +1049,6 @@ class PDFInventoryApp:
                     os.unlink(temp_name)
                 except OSError:
                     pass
-
-    @staticmethod
-    def _get_base_directory() -> str:
-        if getattr(sys, "frozen", False):
-            return os.path.dirname(os.path.abspath(sys.executable))
-        return os.path.dirname(os.path.abspath(__file__))
 
     @staticmethod
     def _get_system_language() -> str:

@@ -4,7 +4,7 @@ This project improves in short, reversible iterations. Each iteration has one th
 
 ## Current baseline
 
-The app is a local desktop utility. It does not collect analytics or send user data. Since Iteration 4, warnings and errors go to a small rotating log file in the user's application folder.
+The app is a local, portable desktop utility. It does not collect analytics or send user data. Since Iteration 6, its settings, rename reports and log file live in `pdf_inventory_data` next to the program.
 
 | Area | Current measure | Target | Evidence source |
 | --- | --- | --- | --- |
@@ -13,7 +13,7 @@ The app is a local desktop utility. It does not collect analytics or send user d
 | UI memory pressure | At most 512 pending worker-to-UI events | No unbounded event backlog | Unit test and code review |
 | Scan correctness | Junctions not followed; system names skipped only below a drive root; hard links count once | Zero repeated files and zero lost library folders | Unit tests |
 | Rename safety | Preview first; no overwrites; every run journaled and reported; undo from any report | Zero overwritten files; every completed rename recoverable | Unit tests |
-| Core correctness | 44 unit tests; Windows 3.10–3.13, plus Windows and Ubuntu jobs with pypdf | Pass on every pull request and `main` push | GitHub Actions |
+| Core correctness | 48 unit tests; Windows 3.10–3.13, plus Windows and Ubuntu jobs with pypdf | Pass on every pull request and `main` push | GitHub Actions |
 | User friction | Not yet measured | Record a short task-completion check before workflow changes | Manual usability check |
 
 ## Iteration record
@@ -121,9 +121,31 @@ This iteration and Iteration 5 were done together at the maintainer's request. T
   - The visible-rows-only test confirms that a search limits the plan.
   - A test confirms that shortcuts are ignored while the dialog is open.
   - Disabling journaling makes the crash test fail.
-  - The real-library cleanup is still pending.
+  - **Real library, 2026-11-01:** the first cleanup renamed 85 of 85 files, matching the 85 matches the inventory export predicted, and saved its undo report. A spot check of the renamed files is still with the user.
 - **Rollback:** Revert the iteration commit. Undo any renames first with **Tools → Undo a filename cleanup…**, or with the restored script's `--undo` option.
 - **Review date:** 2026-11-15, or after the first real cleanup if sooner.
+
+### Iteration 6 — fully portable
+
+- **Owner:** Repository maintainer.
+- **Reason:** The user copies the program into a library and starts it there. Settings, rename reports and the log still went to `%APPDATA%\PDFMasterSuite`, away from the program and the library they belong to.
+- **Change:**
+  - All app data goes into `pdf_inventory_data` next to the program (next to the executable when packaged). Nothing is written to per-user folders, with no fallback.
+  - One `program_dir()` function decides both the start folder and the data folder.
+  - `.gitignore` excludes the data folder so running from the repository leaves the tree clean.
+- **Acceptance:**
+  - Settings, reports and log resolve inside `pdf_inventory_data` for both the script and a packaged executable.
+  - No code path reads `%APPDATA%`, `XDG_CONFIG_HOME` or `~/Library`.
+- **Success metric:** 0 files written outside the program folder during a launch, scan and cleanup.
+- **Rollout:** Unit tests, then a real launch from the repository confirming that the data folder appears next to `pdf_inventory.py`.
+- **Verification result:**
+  - 48 unit tests pass (one skipped because pypdf is installed), including new tests for the script and packaged-executable data paths.
+  - A copy of `pdf_inventory.py` launched through `main()` from a temporary folder started there and wrote `settings.json` and `pdf_inventory.log` into `pdf_inventory_data` beside it.
+  - `%APPDATA%\PDFMasterSuite` received no new or changed files.
+- **Known limit:** In a read-only program folder, settings are not saved and cleanup refuses to rename, because the undo report cannot be written. This was chosen over a hidden fallback location.
+- **Migration:** Reports from earlier versions stay in `%APPDATA%\PDFMasterSuite\rename_reports` and still undo through the file picker; nothing is moved automatically.
+- **Rollback:** Revert the iteration commit.
+- **Review date:** 2026-11-15.
 
 ## Filename cleaner history
 

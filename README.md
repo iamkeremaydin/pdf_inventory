@@ -43,13 +43,17 @@ It works on the rows currently visible in the table, so you can narrow the set w
 
 Only names change; file contents are never opened for writing. Every run saves a report, and **Tools → Undo a filename cleanup…** restores the original names from any report, including reports made by the former `pdf_filename_cleaner.py` script.
 
-## Files the app writes
+## Files the app writes (portable)
 
-All in the per-user application folder: `%APPDATA%\PDFMasterSuite` on Windows, `~/Library/Application Support/PDFMasterSuite` on macOS, and `~/.config/PDFMasterSuite` on Linux.
+The app is fully portable. Everything it writes goes into a `pdf_inventory_data` folder next to `pdf_inventory.py`, or next to the executable if it is packaged. Nothing is written to `%APPDATA%` or other per-user folders. Each copy of the program keeps its own data, and moving or copying the program folder takes the data with it.
 
 - `settings.json`: language, CSV separator, last export folder and window position. A window position that is no longer on any screen is ignored.
 - `rename_reports/`: one CSV report per filename cleanup or undo.
 - `pdf_inventory.log`: warnings and errors, kept small by rotation.
+
+Keep the program in a folder you can write to. If that folder is read-only, the app still scans and exports, but settings are not saved, and filename cleanup refuses to rename anything because it cannot save the undo report.
+
+Versions before portable mode wrote to `%APPDATA%\PDFMasterSuite`. Reports saved there still work: in **Tools → Undo a filename cleanup…**, browse to that folder's `rename_reports`. You can delete the old folder once you no longer need those reports.
 
 ## Keyboard shortcuts
 
