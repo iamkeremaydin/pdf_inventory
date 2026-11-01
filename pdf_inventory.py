@@ -93,6 +93,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "msg_folder_error": "The folder could not be opened:\n{error}",
         "msg_file_error": "The file could not be opened:\n{error}",
         "msg_copy_error": "The path could not be copied:\n{error}",
+        "msg_invalid_folder": "The selected folder does not exist or cannot be accessed.",
         "open_file": "Open file",
         "open_folder": "Open containing folder",
         "copy_path": "Copy full path",
@@ -155,6 +156,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "msg_folder_error": "Klasör açılamadı:\n{error}",
         "msg_file_error": "Dosya açılamadı:\n{error}",
         "msg_copy_error": "Dosya yolu kopyalanamadı:\n{error}",
+        "msg_invalid_folder": "Seçilen klasör mevcut değil veya erişilemiyor.",
         "open_file": "Dosyayı aç",
         "open_folder": "Bulunduğu klasörü aç",
         "copy_path": "Tam yolu kopyala",
@@ -180,6 +182,9 @@ FULL_HASH_CHUNK = 1024 * 1024
 # Keep reader and hashing concurrency predictable on machines with many cores.
 MAX_SCAN_WORKERS = 4
 MAX_IN_FLIGHT_PER_WORKER = 2
+# Backpressure prevents a fast scanner from retaining an unbounded number of
+# pending UI updates while the main thread renders a large result set.
+MAX_UI_QUEUE_EVENTS = 512
 
 
 def normalize_search(value: str) -> str:
@@ -234,6 +239,8 @@ def _quick_hash(path: Path, expected_size: int, expected_mtime_ns: int | None = 
 def _full_hash(path: Path, expected_size: int, expected_mtime_ns: int | None = None,
                cancel_event: threading.Event | None = None) -> str | None:
     """Compute SHA-256 in bounded chunks and reject files changed mid-scan."""
+    if cancel_event is not None and cancel_event.is_set():
+        return None
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         while True:
@@ -310,7 +317,7 @@ class PDFInventoryApp:
         self._pending_render_set: set[str] = set()
         self._table_mode: tuple[str, str | None, bool, bool] | None = None
         self._visible_paths: list[str] = []
-        self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=MAX_UI_QUEUE_EVENTS)
         self._cancel_event = threading.Event()
         self._scan_thread: threading.Thread | None = None
         self.is_scanning = False
@@ -645,7 +652,7 @@ class PDFInventoryApp:
             return
         root_path = Path(self.target_directory).expanduser()
         if not root_path.exists() or not root_path.is_dir():
-            messagebox.showerror(self._t("msg_error"), self._t("status_scan_error", error="Folder does not exist or is not accessible."))
+            messagebox.showerror(self._t("msg_error"), self._t("msg_invalid_folder"))
             return
 
         self.records.clear()

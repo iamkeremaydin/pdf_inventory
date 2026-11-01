@@ -1,12 +1,40 @@
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 
-from pdf_inventory import MAX_IN_FLIGHT_PER_WORKER, MAX_SCAN_WORKERS, normalize_search, resolve_csv_delimiter, sanitize_csv_cell
+from pdf_inventory import (
+    MAX_IN_FLIGHT_PER_WORKER,
+    MAX_SCAN_WORKERS,
+    MAX_UI_QUEUE_EVENTS,
+    _full_hash,
+    _quick_hash,
+    normalize_search,
+    resolve_csv_delimiter,
+    sanitize_csv_cell,
+)
 
 
 class InventoryHelpersTest(unittest.TestCase):
     def test_scan_concurrency_is_fixed_and_bounded(self):
         self.assertEqual(MAX_SCAN_WORKERS, 4)
         self.assertEqual(MAX_SCAN_WORKERS * MAX_IN_FLIGHT_PER_WORKER, 8)
+        self.assertEqual(MAX_UI_QUEUE_EVENTS, 512)
+
+    def test_hashes_are_stable_and_full_hash_honors_cancellation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sample.pdf"
+            path.write_bytes(b"PDF inventory test data")
+            stat = path.stat()
+
+            self.assertIsNotNone(_quick_hash(path, stat.st_size, stat.st_mtime_ns))
+            self.assertIsNotNone(_full_hash(path, stat.st_size, stat.st_mtime_ns))
+
+            cancelled = threading.Event()
+            cancelled.set()
+            self.assertIsNone(
+                _full_hash(Path(directory) / "missing.pdf", stat.st_size, stat.st_mtime_ns, cancelled)
+            )
 
     def test_search_normalization_handles_turkish_and_diacritics(self):
         self.assertEqual(normalize_search("İstanbul ıŞık café"), "istanbul isik cafe")
@@ -18,6 +46,12 @@ class InventoryHelpersTest(unittest.TestCase):
     def test_csv_formula_prefix_is_neutralized(self):
         self.assertEqual(sanitize_csv_cell("  =1+1"), "'  =1+1")
         self.assertEqual(sanitize_csv_cell(42), 42)
+
+    def test_invalid_folder_message_is_translated(self):
+        from pdf_inventory import TRANSLATIONS
+
+        for language in ("en", "tr"):
+            self.assertTrue(TRANSLATIONS[language]["msg_invalid_folder"])
 
 
 if __name__ == "__main__":
