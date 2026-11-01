@@ -13,12 +13,16 @@ import os
 import re
 import sys
 import tempfile
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PYTHON_EXECUTABLE = re.compile(r"(py|pyw|python[\d.]*w?)\.exe", re.IGNORECASE)
 
 MARKER_SUFFIX = re.compile(
     r"\s*\((?P<marker>z-library|z-library\.sk\s*,\s*1lib\.sk\s*,\s*z-lib\.sk)\)\s*$",
@@ -244,17 +248,61 @@ def print_summary(plans: list[RenamePlan], dry_run: bool, root: Path | None = No
             print(f"  {plan.status}: {plan.source} — {plan.detail}")
 
 
-def parse_args() -> argparse.Namespace:
+def launched_without_terminal() -> bool:
+    """Return True when Windows opened a console only for this script, e.g. after a double-click.
+
+    Such a console closes as soon as the script exits, so output would vanish unread.
+    """
+    if os.name != "nt" or not sys.stdin.isatty():
+        return False
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32),
+        )
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        pids = (ctypes.c_uint32 * 16)()
+        count = kernel32.GetConsoleProcessList(pids, len(pids))
+        if not 0 < count <= len(pids):
+            return False
+        # A shell (cmd, PowerShell, bash) shares the console when run from a terminal.
+        for pid in pids[:count]:
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            try:
+                buffer = ctypes.create_unicode_buffer(32768)
+                size = ctypes.c_uint32(len(buffer))
+                if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                    return False
+            finally:
+                kernel32.CloseHandle(handle)
+            if not PYTHON_EXECUTABLE.fullmatch(Path(buffer.value).name):
+                return False
+        return True
+    except (AttributeError, OSError):
+        return False
+
+
+def pause_before_exit() -> None:
+    try:
+        input("\nPress Enter to close this window...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Remove confirmed Z-Library suffixes from PDF filenames without opening PDFs."
     )
-    parser.add_argument("root", nargs="?", default=".", type=Path,
-                        help="Folder to scan recursively (default: current folder).")
+    parser.add_argument("root", nargs="?", default=SCRIPT_DIR, type=Path,
+                        help="Folder to scan recursively (default: the folder containing this script).")
     parser.add_argument("--apply", action="store_true", help="Rename files after confirmation.")
     parser.add_argument("--undo", type=Path, metavar="REPORT", help="Restore completed renames from a cleaner report.")
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt; requires --apply.")
     parser.add_argument("--report", type=Path, help="CSV path for a preview or final audit report.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def run_undo(report_path: Path, output_report: Path | None) -> int:
@@ -288,8 +336,11 @@ def run_undo(report_path: Path, output_report: Path | None) -> int:
     return 1 if any(plan.status == "error" for plan in outcomes) else 0
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None, double_clicked: bool = False) -> int:
+    args = parse_args(argv)
+    if double_clicked:
+        # No way to pass --apply from Explorer; the RENAME confirmation still guards the change.
+        args.apply = True
     root = args.root.expanduser()
     if args.undo:
         if args.apply or args.yes:
@@ -303,12 +354,20 @@ def main() -> int:
         print(f"Folder does not exist or is not accessible: {root}", file=sys.stderr)
         return 2
 
+    print(f"Scanning {root.resolve()} and all subfolders...", flush=True)
     pdf_files, warnings = scan_pdf_files(root)
     plans = plan_renames(pdf_files)
-    print(f"Scanned {len(pdf_files)} PDF file(s) below {root.resolve()}.")
+    print(f"Found {len(pdf_files)} PDF file(s).")
     print_summary(plans, dry_run=True, root=root)
     for warning in warnings:
         print(f"Warning: {warning}", file=sys.stderr)
+    if not pdf_files:
+        print("No PDF files were found. Put this script in the folder that holds your PDFs, "
+              f'or pass that folder: python {Path(sys.argv[0]).name} "C:\\Books"')
+    elif not plans:
+        print("No PDF filename ends with a supported Z-Library tag, so nothing needs renaming.")
+    elif not args.apply and any(plan.status == "ready" for plan in plans):
+        print("This was a preview; no files were renamed. Run again with --apply to rename them.")
 
     results = plans
     report_path: Path | None = args.report.expanduser() if args.report else None
@@ -344,5 +403,17 @@ def main() -> int:
     return 1 if any(plan.status == "error" for plan in results) else 0
 
 
+def entry_point() -> int:
+    if not launched_without_terminal():
+        return main()
+    try:
+        return main(double_clicked=True)
+    except Exception:
+        traceback.print_exc()
+        return 1
+    finally:
+        pause_before_exit()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entry_point())

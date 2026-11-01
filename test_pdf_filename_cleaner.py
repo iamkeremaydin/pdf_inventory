@@ -1,12 +1,18 @@
+import contextlib
 import csv
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from pdf_filename_cleaner import (
+    SCRIPT_DIR,
     apply_renames,
     cleaned_pdf_name,
     load_undo_plans,
+    main,
+    parse_args,
     plan_renames,
     scan_pdf_files,
     write_report,
@@ -94,6 +100,41 @@ class PdfFilenameCleanerTest(unittest.TestCase):
 
             self.assertEqual(plans, [])
             self.assertEqual(warnings, ["Ignored invalid report row 2."])
+
+    def test_default_folder_is_the_script_folder_not_the_working_directory(self):
+        self.assertEqual(parse_args([]).root, SCRIPT_DIR)
+
+    def test_preview_explains_that_nothing_was_renamed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "nested" / "Book (Z-Library).pdf"
+            source.parent.mkdir()
+            source.write_bytes(b"pdf bytes")
+            output = io.StringIO()
+
+            with contextlib.redirect_stdout(output):
+                code = main([str(root)])
+
+            self.assertEqual(code, 0)
+            self.assertTrue(source.exists())
+            self.assertIn("no files were renamed", output.getvalue())
+
+    def test_double_click_run_asks_for_confirmation_then_renames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "nested" / "Book (Z-Library).pdf"
+            source.parent.mkdir()
+            source.write_bytes(b"pdf bytes")
+
+            with mock.patch("builtins.input", return_value="RENAME") as prompt, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = main([str(root)], double_clicked=True)
+
+            self.assertEqual(code, 0)
+            prompt.assert_called_once()
+            self.assertFalse(source.exists())
+            self.assertEqual((root / "nested" / "Book.pdf").read_bytes(), b"pdf bytes")
+            self.assertEqual(len(list(root.glob("pdf_filename_cleaner_*.csv"))), 1)
 
 
 if __name__ == "__main__":

@@ -26,15 +26,19 @@ Settings are saved in the operating system's standard per-user application confi
 
 ## PDF filename cleaner
 
-`pdf_filename_cleaner.py` is a separate, standard-library command-line utility. It scans the current folder and every subfolder for PDFs, then removes only these exact terminal filename tags:
+`pdf_filename_cleaner.py` is a separate, standard-library command-line utility. It scans a folder and every subfolder for PDFs, then removes only these exact terminal filename tags:
 
 - `(Z-Library)`
 - `(z-library.sk, 1lib.sk, z-lib.sk)`
 
 It does not open, modify, or rewrite PDF contents. The default mode lists every planned rename as a preview. It skips name collisions instead of overwriting a file and does not remove markers that are followed by other filename text.
 
+Without a folder argument it scans the folder that contains the script, wherever it is run from.
+
+On Windows you can also copy the script into your PDF folder and double-click it. It shows the preview, asks you to type `RENAME`, writes an audit report, and keeps the window open until you press Enter. Dropping a folder onto the script scans that folder instead.
+
 ```bash
-# Preview the current folder tree
+# Preview the script's folder tree
 python pdf_filename_cleaner.py
 
 # Preview a different folder
