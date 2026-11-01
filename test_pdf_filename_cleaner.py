@@ -1,8 +1,16 @@
+import csv
 import tempfile
 import unittest
 from pathlib import Path
 
-from pdf_filename_cleaner import apply_renames, cleaned_pdf_name, plan_renames, scan_pdf_files
+from pdf_filename_cleaner import (
+    apply_renames,
+    cleaned_pdf_name,
+    load_undo_plans,
+    plan_renames,
+    scan_pdf_files,
+    write_report,
+)
 
 
 class PdfFilenameCleanerTest(unittest.TestCase):
@@ -55,6 +63,37 @@ class PdfFilenameCleanerTest(unittest.TestCase):
             self.assertEqual(outcomes[0].status, "renamed")
             self.assertFalse(source.exists())
             self.assertEqual(destination.read_bytes(), b"unchanged PDF bytes")
+
+    def test_report_guided_undo_restores_the_original_filename_and_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "Book (Z-Library).pdf"
+            report = root / "rename-report.csv"
+            source.write_bytes(b"unchanged PDF bytes")
+
+            renamed = apply_renames(plan_renames([source]))
+            write_report(report, renamed)
+            undo_plans, warnings = load_undo_plans(report)
+            restored = apply_renames(undo_plans)
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(restored[0].status, "renamed")
+            self.assertTrue(source.exists())
+            self.assertEqual(source.read_bytes(), b"unchanged PDF bytes")
+
+    def test_undo_ignores_report_rows_that_are_not_tool_created_renames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "untrusted-report.csv"
+            with report.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(("Status", "Marker", "Source", "Destination", "Detail"))
+                writer.writerow(("renamed", "", root / "unrelated.pdf", root / "other.pdf", "Injected"))
+
+            plans, warnings = load_undo_plans(report)
+
+            self.assertEqual(plans, [])
+            self.assertEqual(warnings, ["Ignored invalid report row 2."])
 
 
 if __name__ == "__main__":

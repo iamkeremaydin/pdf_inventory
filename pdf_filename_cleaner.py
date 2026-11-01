@@ -15,6 +15,7 @@ import sys
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -159,8 +160,9 @@ def write_report(destination: Path, plans: Iterable[RenamePlan]) -> None:
             writer = csv.writer(stream, lineterminator="\r\n")
             writer.writerow(("Status", "Marker", "Source", "Destination", "Detail"))
             for plan in plans:
-                writer.writerow((plan.status, plan.marker or "", str(plan.source),
-                                 str(plan.destination or ""), plan.detail))
+                writer.writerow(tuple(_safe_csv_cell(value) for value in (
+                    plan.status, plan.marker or "", str(plan.source), str(plan.destination or ""), plan.detail,
+                )))
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp_name, destination)
@@ -173,12 +175,58 @@ def write_report(destination: Path, plans: Iterable[RenamePlan]) -> None:
                 pass
 
 
-def print_summary(plans: list[RenamePlan], dry_run: bool, root: Path | None = None) -> None:
+def _safe_csv_cell(value: str) -> str:
+    """Prevent spreadsheet formula execution when a report is opened in a spreadsheet."""
+    if value.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+def default_report_path(root: Path, prefix: str) -> Path:
+    """Return an unused, timestamped report path inside root."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for index in range(1, 10_000):
+        suffix = "" if index == 1 else f"_{index}"
+        candidate = root / f"{prefix}_{timestamp}{suffix}.csv"
+        if not candidate.exists():
+            return candidate
+    raise OSError("Could not allocate a unique report filename")
+
+
+def load_undo_plans(report_path: Path) -> tuple[list[RenamePlan], list[str]]:
+    """Load only validated completed renames from one of this tool's CSV reports."""
+    plans: list[RenamePlan] = []
+    warnings: list[str] = []
+    required_columns = {"Status", "Marker", "Source", "Destination", "Detail"}
+    try:
+        with report_path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if not reader.fieldnames or not required_columns.issubset(reader.fieldnames):
+                return [], ["The report does not have the expected cleaner columns."]
+            for row_number, row in enumerate(reader, start=2):
+                if row.get("Status") != "renamed":
+                    continue
+                original = Path(row.get("Source") or "")
+                current = Path(row.get("Destination") or "")
+                cleaned = cleaned_pdf_name(original.name)
+                if (not original.is_absolute() or not current.is_absolute() or original.parent != current.parent
+                        or not cleaned or cleaned[0] != current.name):
+                    warnings.append(f"Ignored invalid report row {row_number}.")
+                    continue
+                plans.append(RenamePlan(current, original, row.get("Marker") or None,
+                                        "ready", "Ready to restore the original filename"))
+    except (OSError, csv.Error, UnicodeError) as exc:
+        return [], [f"Could not read report: {exc}"]
+    return plans, warnings
+
+
+def print_summary(plans: list[RenamePlan], dry_run: bool, root: Path | None = None,
+                  subject: str = "matching PDF file(s)") -> None:
     counts: dict[str, int] = defaultdict(int)
     for plan in plans:
         counts[plan.status] += 1
     title = "Preview" if dry_run else "Completed"
-    print(f"{title}: {len(plans)} matching PDF file(s)")
+    print(f"{title}: {len(plans)} {subject}")
     for status in ("ready", "renamed", "collision", "skipped", "error"):
         if counts[status]:
             print(f"  {status}: {counts[status]}")
@@ -203,14 +251,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("root", nargs="?", default=".", type=Path,
                         help="Folder to scan recursively (default: current folder).")
     parser.add_argument("--apply", action="store_true", help="Rename files after confirmation.")
+    parser.add_argument("--undo", type=Path, metavar="REPORT", help="Restore completed renames from a cleaner report.")
     parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt; requires --apply.")
-    parser.add_argument("--report", type=Path, help="Optional CSV path for the preview or final results.")
+    parser.add_argument("--report", type=Path, help="CSV path for a preview or final audit report.")
     return parser.parse_args()
+
+
+def run_undo(report_path: Path, output_report: Path | None) -> int:
+    plans, warnings = load_undo_plans(report_path.expanduser())
+    for warning in warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+    if not plans:
+        return 1
+    print(f"Undo preview: {len(plans)} completed rename(s) from {report_path}.")
+    print_summary(plans, dry_run=True, subject="restore operation(s)")
+    try:
+        answer = input("Type UNDO to restore the ready filenames: ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+        print()
+    if answer != "UNDO":
+        print("No files were restored.")
+        return 0
+
+    outcomes = apply_renames(plans)
+    print_summary(outcomes, dry_run=False, subject="restore operation(s)")
+    destination = output_report.expanduser() if output_report else default_report_path(
+        report_path.expanduser().parent, "pdf_filename_cleaner_undo"
+    )
+    try:
+        write_report(destination, outcomes)
+    except OSError as exc:
+        print(f"Could not write undo report: {exc}", file=sys.stderr)
+        return 1
+    print(f"Undo report written to {destination.resolve()}.")
+    return 1 if any(plan.status == "error" for plan in outcomes) else 0
 
 
 def main() -> int:
     args = parse_args()
     root = args.root.expanduser()
+    if args.undo:
+        if args.apply or args.yes:
+            print("--undo cannot be combined with --apply or --yes.", file=sys.stderr)
+            return 2
+        return run_undo(args.undo, args.report)
     if args.yes and not args.apply:
         print("--yes can only be used with --apply.", file=sys.stderr)
         return 2
@@ -226,6 +311,7 @@ def main() -> int:
         print(f"Warning: {warning}", file=sys.stderr)
 
     results = plans
+    report_path: Path | None = args.report.expanduser() if args.report else None
     if args.apply and any(plan.status == "ready" for plan in plans):
         confirmed = args.yes
         if not confirmed:
@@ -238,11 +324,16 @@ def main() -> int:
             if not confirmed:
                 print("No files were renamed.")
         if confirmed:
+            report_path = report_path or default_report_path(root, "pdf_filename_cleaner")
+            try:
+                write_report(report_path, [])
+            except OSError as exc:
+                print(f"Could not create the audit report: {exc}", file=sys.stderr)
+                return 1
             results = apply_renames(plans)
             print_summary(results, dry_run=False)
 
-    if args.report:
-        report_path = args.report.expanduser()
+    if report_path:
         try:
             write_report(report_path, results)
         except OSError as exc:

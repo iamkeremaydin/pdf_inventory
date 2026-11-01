@@ -43,8 +43,14 @@ python pdf_filename_cleaner.py "C:\\Books"
 # Apply the reviewed renames after typing RENAME
 python pdf_filename_cleaner.py "C:\\Books" --apply
 
-# Apply without a prompt and write an audit report
-python pdf_filename_cleaner.py "C:\\Books" --apply --yes --report rename-report.csv
+# Apply without a prompt. An audit report is created automatically.
+python pdf_filename_cleaner.py "C:\\Books" --apply --yes
+
+# Restore completed renames from an audit report after typing UNDO
+python pdf_filename_cleaner.py --undo pdf_filename_cleaner_20261101_151258.csv
+
+# Choose where to save a preview, final audit, or undo report
+python pdf_filename_cleaner.py "C:\\Books" --report rename-report.csv
 ```
 
 ## Quality checks
