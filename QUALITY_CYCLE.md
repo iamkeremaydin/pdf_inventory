@@ -20,6 +20,7 @@ The app is a local desktop utility. It does not collect analytics or send user d
 - **Owner:** Repository maintainer.
 - **Reason:** Large folders could create unbounded background work or pending UI updates.
 - **Change:** Limit inspection and hash workers to four, cap submitted work at eight, and cap pending UI events at 512.
+- **Foundation:** Add a read-only CI workflow with immutable action revisions and monthly action updates.
 - **Acceptance:** No unbounded task or event queue; cancellation remains available.
 - **Verify:** `python -m unittest -v`; manually scan a large folder and cancel during each scan stage.
 - **Rollback:** Revert the iteration commit.
