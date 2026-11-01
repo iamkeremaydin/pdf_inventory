@@ -17,7 +17,10 @@ The cleaner removes two confirmed source tags from the end of PDF filenames. It 
 - **Reason:** A rename without an audit record is hard to reverse accurately.
 - **Change:** Create an audit CSV automatically for applied runs and add validated, confirmed undo from that report.
 - **Acceptance:** Every applied run produces a report. Undo restores only tool-created rename pairs and skips conflicts.
+- **Success metric:** 100% of applied runs create an audit report; the apply-and-undo test restores the original name and bytes.
+- **Rollout:** Run a preview, apply the cleaner to a temporary folder, then run undo from its generated report before using a real library.
 - **Verify:** Run the unit tests and perform a temporary-folder apply/undo check.
+- **Verification result:** 13 unit tests pass. A temporary-folder run renamed both markers across a nested folder, created its audit report automatically, and undo restored both original filenames and bytes.
 - **Rollback:** Do not apply the preview, or run the generated undo report.
 - **Review date:** After the first user-run cleanup.
 
@@ -32,8 +35,8 @@ The cleaner removes two confirmed source tags from the end of PDF filenames. It 
 
 ## Backlog
 
-| Priority | Hypothesis | Owner | Success metric | Effort | Risk | Decision |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | A small GUI folder picker will reduce command-line setup errors | Fewer invalid-folder errors | Repository maintainer | Medium | Medium | Validate demand first |
-| 2 | A per-marker selection option helps users control mixed libraries | Fewer unintended exclusions | Repository maintainer | Small | Low | Add only after real examples require it |
-| 3 | A signed standalone executable reduces setup friction | Faster first successful run | Repository maintainer | Medium | Medium | Requires release and signing decision |
+| Priority | Hypothesis | Owner | Value | Success metric | Effort | Risk | Decision |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | A small GUI folder picker will reduce command-line setup errors | Repository maintainer | High | Fewer invalid-folder errors | Medium | Medium | Validate demand first |
+| 2 | A per-marker selection option helps users control mixed libraries | Repository maintainer | Medium | Fewer unintended exclusions | Small | Low | Add only after real examples require it |
+| 3 | A signed standalone executable reduces setup friction | Repository maintainer | High | Faster first successful run | Medium | Medium | Requires release and signing decision |
