@@ -136,6 +136,25 @@ class PdfFilenameCleanerTest(unittest.TestCase):
             self.assertEqual((root / "nested" / "Book.pdf").read_bytes(), b"pdf bytes")
             self.assertEqual(len(list(root.glob("pdf_filename_cleaner_*.csv"))), 1)
 
+    def test_audit_report_keeps_renames_when_the_final_summary_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "Book (Z-Library).pdf"
+            report = root / "audit.csv"
+            source.write_bytes(b"pdf bytes")
+
+            def fail_after_apply(plans, dry_run, *args, **kwargs):
+                if not dry_run:
+                    raise KeyboardInterrupt
+
+            with mock.patch("pdf_filename_cleaner.print_summary", side_effect=fail_after_apply), \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+                main([str(root), "--apply", "--yes", "--report", str(report)])
+
+            undo_plans, warnings = load_undo_plans(report)
+            self.assertEqual(warnings, [])
+            self.assertEqual([plan.destination for plan in undo_plans], [source])
+
 
 if __name__ == "__main__":
     unittest.main()

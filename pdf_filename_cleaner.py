@@ -323,14 +323,17 @@ def run_undo(report_path: Path, output_report: Path | None) -> int:
         return 0
 
     outcomes = apply_renames(plans)
-    print_summary(outcomes, dry_run=False, subject="restore operation(s)")
     destination = output_report.expanduser() if output_report else default_report_path(
         report_path.expanduser().parent, "pdf_filename_cleaner_undo"
     )
+    report_error: OSError | None = None
     try:
         write_report(destination, outcomes)
     except OSError as exc:
-        print(f"Could not write undo report: {exc}", file=sys.stderr)
+        report_error = exc
+    print_summary(outcomes, dry_run=False, subject="restore operation(s)")
+    if report_error:
+        print(f"Could not write undo report: {report_error}", file=sys.stderr)
         return 1
     print(f"Undo report written to {destination.resolve()}.")
     return 1 if any(plan.status == "error" for plan in outcomes) else 0
@@ -370,6 +373,7 @@ def main(argv: list[str] | None = None, double_clicked: bool = False) -> int:
         print("This was a preview; no files were renamed. Run again with --apply to rename them.")
 
     results = plans
+    applied = False
     report_path: Path | None = args.report.expanduser() if args.report else None
     if args.apply and any(plan.status == "ready" for plan in plans):
         confirmed = args.yes
@@ -390,14 +394,21 @@ def main(argv: list[str] | None = None, double_clicked: bool = False) -> int:
                 print(f"Could not create the audit report: {exc}", file=sys.stderr)
                 return 1
             results = apply_renames(plans)
-            print_summary(results, dry_run=False)
+            applied = True
 
+    # Save outcomes before printing them, so undo still works if the output fails.
+    report_error: OSError | None = None
     if report_path:
         try:
             write_report(report_path, results)
         except OSError as exc:
-            print(f"Could not write report: {exc}", file=sys.stderr)
-            return 1
+            report_error = exc
+    if applied:
+        print_summary(results, dry_run=False)
+    if report_error:
+        print(f"Could not write report: {report_error}", file=sys.stderr)
+        return 1
+    if report_path:
         print(f"Report written to {report_path.resolve()}.")
 
     return 1 if any(plan.status == "error" for plan in results) else 0
