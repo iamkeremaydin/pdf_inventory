@@ -10,14 +10,28 @@ permissions:
 
 jobs:
   test:
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        pypdf: [false]
+        include:
+          # Exercise real page counting with the optional PDF library.
+          - os: windows-latest
+            python-version: "3.13"
+            pypdf: true
+          # Cover the non-Windows code paths; window tests skip when there is no display.
+          - os: ubuntu-latest
+            python-version: "3.13"
+            pypdf: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m compileall -q pdf_inventory.py pdf_filename_cleaner.py test_pdf_inventory.py test_pdf_filename_cleaner.py
+      - if: matrix.pypdf
+        run: python -m pip install "pypdf==6.21.4"
+      - run: python -m compileall -q pdf_inventory.py test_pdf_inventory.py
       - run: python -m unittest -v

@@ -7,6 +7,7 @@ import hashlib
 import json
 import locale
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import queue
 import re
@@ -14,12 +15,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unicodedata
 from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass, replace
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -69,7 +72,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "status_scanning": "Inspecting PDFs: {current}/{total}",
         "status_hashing_quick": "Checking duplicate candidates (quick hash): {current}/{total}",
         "status_hashing_full": "Verifying possible duplicates (SHA-256): {current}/{total}",
-        "status_done": "Done: {count} PDFs · {duplicates} duplicate files · {corrupt} corrupted · {errors} unreadable · {skipped} folders skipped.",
+        "status_done": "Done: {count} PDFs · {duplicates} duplicate files in {groups} groups ({reclaimable} reclaimable) · {corrupt} corrupted · {errors} unreadable · {skipped} folders skipped.",
         "status_cancelled": "Cancelled: {count} PDFs collected · {duplicates} duplicates confirmed.",
         "status_no_pdf": "No PDF files were found in the selected folder.",
         "status_cancelling": "Cancelling… finishing active file operations.",
@@ -107,6 +110,45 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "skip_reason_system": "System folder",
         "skip_reason_link": "Link or junction",
         "skip_reason_access": "No access",
+        "col_problem": "Problem",
+        "col_size_bytes": "Size (bytes)",
+        "dup_group": "Yes · group {group}",
+        "csv_files": "CSV files",
+        "all_files": "All files",
+        "menu_file": "File",
+        "menu_tools": "Tools",
+        "menu_select_folder": "Select folder…",
+        "menu_exit": "Exit",
+        "tool_clean": "Clean PDF filenames…",
+        "tool_undo": "Undo a filename cleanup…",
+        "clean_title": "Clean PDF filenames",
+        "clean_intro": "Removes the “(Z-Library)” and “(z-library.sk, 1lib.sk, z-lib.sk)” tags from the end of PDF names among the {total} visible rows. Only names change; file contents are never modified. A report is saved so you can undo the renames with Tools → Undo a filename cleanup.",
+        "clean_none": "None of the {total} visible PDF names ends with a supported Z-Library tag.",
+        "clean_apply": "Rename {count} files",
+        "clean_done": "Renamed {renamed} of {total} files.\n\nUndo report:\n{report}",
+        "undo_title": "Undo a filename cleanup",
+        "undo_intro": "Restores the original names recorded in {report}.",
+        "undo_ignored": "{count} report rows were ignored because they do not match a cleanup rename.",
+        "undo_nothing": "This report has no completed renames to restore.",
+        "undo_invalid": "This file cannot be used to undo a cleanup:\n{details}",
+        "undo_apply": "Restore {count} names",
+        "undo_done": "Restored {renamed} of {total} names.\n\nReport:\n{report}",
+        "choose_report": "Select a cleanup report",
+        "col_status": "Status",
+        "col_current": "Current name",
+        "col_new": "New name",
+        "rename_status_ready": "Ready",
+        "rename_status_collision": "Name taken",
+        "rename_status_skipped": "File missing",
+        "rename_status_error": "Error",
+        "rename_status_renamed": "Renamed",
+        "rename_counts": "{ready} ready · {blocked} cannot be renamed",
+        "rename_problems": "{count} could not be renamed; the report lists why.",
+        "cancel": "Cancel",
+        "msg_report_error": "The rename report could not be created, so no files were renamed:\n{error}",
+        "msg_report_final_error": "Files were renamed, but the report could not be saved:\n{error}\n\nThe renamed files are listed in the log file:\n{log}",
+        "status_renamed": "Renamed {count} PDF filenames. Undo report saved.",
+        "status_restored": "Restored {count} PDF filenames.",
     },
     "tr": {
         "title": "PDF Master Suite — Envanter",
@@ -137,7 +179,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "status_scanning": "PDF'ler inceleniyor: {current}/{total}",
         "status_hashing_quick": "Yinelenen adayları hızlı hash ile kontrol ediliyor: {current}/{total}",
         "status_hashing_full": "Olası kopyalar SHA-256 ile doğrulanıyor: {current}/{total}",
-        "status_done": "Tamamlandı: {count} PDF · {duplicates} yinelenen dosya · {corrupt} bozuk · {errors} okunamadı · {skipped} klasör atlandı.",
+        "status_done": "Tamamlandı: {count} PDF · {groups} grupta {duplicates} yinelenen dosya ({reclaimable} kazanılabilir) · {corrupt} bozuk · {errors} okunamadı · {skipped} klasör atlandı.",
         "status_cancelled": "İptal edildi: {count} PDF toplandı · {duplicates} yinelenen dosya doğrulandı.",
         "status_no_pdf": "Seçilen klasörde PDF bulunamadı.",
         "status_cancelling": "İptal ediliyor… devam eden dosya işlemleri tamamlanıyor.",
@@ -175,6 +217,45 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "skip_reason_system": "Sistem klasörü",
         "skip_reason_link": "Sembolik bağlantı veya bağlantı noktası",
         "skip_reason_access": "Erişim yok",
+        "col_problem": "Sorun",
+        "col_size_bytes": "Boyut (bayt)",
+        "dup_group": "Evet · grup {group}",
+        "csv_files": "CSV dosyaları",
+        "all_files": "Tüm dosyalar",
+        "menu_file": "Dosya",
+        "menu_tools": "Araçlar",
+        "menu_select_folder": "Klasör seç…",
+        "menu_exit": "Çıkış",
+        "tool_clean": "PDF dosya adlarını temizle…",
+        "tool_undo": "Dosya adı temizliğini geri al…",
+        "clean_title": "PDF dosya adlarını temizle",
+        "clean_intro": "Görünen {total} satırdaki PDF adlarının sonundaki “(Z-Library)” ve “(z-library.sk, 1lib.sk, z-lib.sk)” etiketlerini kaldırır. Yalnızca adlar değişir; dosya içerikleri asla değiştirilmez. Yeniden adlandırmaları Araçlar → Dosya adı temizliğini geri al ile geri alabilmeniz için bir rapor kaydedilir.",
+        "clean_none": "Görünen {total} PDF adından hiçbiri desteklenen bir Z-Library etiketiyle bitmiyor.",
+        "clean_apply": "{count} dosyayı yeniden adlandır",
+        "clean_done": "{total} dosyadan {renamed} tanesi yeniden adlandırıldı.\n\nGeri alma raporu:\n{report}",
+        "undo_title": "Dosya adı temizliğini geri al",
+        "undo_intro": "{report} raporunda kayıtlı özgün adları geri yükler.",
+        "undo_ignored": "Bir temizlik yeniden adlandırmasıyla eşleşmeyen {count} rapor satırı yok sayıldı.",
+        "undo_nothing": "Bu raporda geri yüklenecek tamamlanmış yeniden adlandırma yok.",
+        "undo_invalid": "Bu dosya bir temizliği geri almak için kullanılamaz:\n{details}",
+        "undo_apply": "{count} adı geri yükle",
+        "undo_done": "{total} addan {renamed} tanesi geri yüklendi.\n\nRapor:\n{report}",
+        "choose_report": "Bir temizlik raporu seçin",
+        "col_status": "Durum",
+        "col_current": "Şimdiki ad",
+        "col_new": "Yeni ad",
+        "rename_status_ready": "Hazır",
+        "rename_status_collision": "Ad kullanımda",
+        "rename_status_skipped": "Dosya bulunamadı",
+        "rename_status_error": "Hata",
+        "rename_status_renamed": "Yeniden adlandırıldı",
+        "rename_counts": "{ready} hazır · {blocked} yeniden adlandırılamaz",
+        "rename_problems": "{count} dosya yeniden adlandırılamadı; nedenleri raporda.",
+        "cancel": "İptal",
+        "msg_report_error": "Yeniden adlandırma raporu oluşturulamadığı için hiçbir dosya yeniden adlandırılmadı:\n{error}",
+        "msg_report_final_error": "Dosyalar yeniden adlandırıldı ancak rapor kaydedilemedi:\n{error}\n\nYeniden adlandırılan dosyalar günlük dosyasında listelenir:\n{log}",
+        "status_renamed": "{count} PDF dosya adı değiştirildi. Geri alma raporu kaydedildi.",
+        "status_restored": "{count} PDF dosya adı geri yüklendi.",
     },
 }
 
@@ -201,6 +282,10 @@ MAX_IN_FLIGHT_PER_WORKER = 2
 # Backpressure prevents a fast scanner from retaining an unbounded number of
 # pending UI updates while the main thread renders a large result set.
 MAX_UI_QUEUE_EVENTS = 512
+# A PDF parse that runs longer than this is reported as unreadable instead of stalling the scan.
+INSPECT_TIMEOUT_SECONDS = 120
+# Sorted or filtered tables rebuild at most this often while a scan streams in new rows.
+SCAN_TABLE_REFRESH_SECONDS = 1.0
 
 
 def skip_reason(path: Path) -> str | None:
@@ -320,18 +405,36 @@ def _full_hash(path: Path, expected_size: int, expected_mtime_ns: int | None = N
     return digest.hexdigest()
 
 
-def inspect_pdf(path: Path) -> dict[str, Any]:
-    """Inspect one PDF without touching Tk; safe to call from a worker thread."""
-    record: dict[str, Any] = {
+def _base_record(path: Path) -> dict[str, Any]:
+    return {
         "path": str(path), "name": path.name, "folder": path.parent.name,
         "size_bytes": None, "mtime": None, "mtime_ns": None, "pages": None,
         "page_state": "unavailable" if not PYPDF_AVAILABLE else "pending",
-        "duplicate": False, "quick_hash": None, "error": None, "file_id": None,
+        "duplicate": False, "duplicate_group": None, "error": None, "file_id": None,
     }
+
+
+def _apply_stat(record: dict[str, Any], stat: os.stat_result) -> None:
+    record.update(size_bytes=stat.st_size, mtime=stat.st_mtime, mtime_ns=stat.st_mtime_ns,
+                  file_id=(stat.st_dev, stat.st_ino) if stat.st_ino else None)
+
+
+def failed_record(path: Path, error: str) -> dict[str, Any]:
+    """Build an unreadable record, keeping size and identity when the file can still be stat'ed."""
+    record = _base_record(path)
+    record.update(page_state="unreadable", error=error)
     try:
-        stat = path.stat()
-        record.update(size_bytes=stat.st_size, mtime=stat.st_mtime, mtime_ns=stat.st_mtime_ns,
-                      file_id=(stat.st_dev, stat.st_ino) if stat.st_ino else None)
+        _apply_stat(record, path.stat())
+    except OSError:
+        pass
+    return record
+
+
+def inspect_pdf(path: Path) -> dict[str, Any]:
+    """Inspect one PDF without touching Tk; safe to call from a worker thread."""
+    record = _base_record(path)
+    try:
+        _apply_stat(record, path.stat())
     except OSError as exc:
         record.update(page_state="unreadable", error=str(exc))
         return record
@@ -355,14 +458,499 @@ def inspect_pdf(path: Path) -> dict[str, Any]:
     except (PermissionError, FileNotFoundError, IsADirectoryError, OSError) as exc:
         record.update(page_state="unreadable", error=str(exc))
     except Exception as exc:
-        record.update(page_state="corrupt", error=str(exc))
+        record.update(page_state="corrupt", error=str(exc) or type(exc).__name__)
     return record
+
+
+def discover_pdfs(root_path: Path, cancel_event: threading.Event,
+                  emit_progress: Callable[[int, int, int], None]) -> tuple[list[Path], list[tuple[str, str]]]:
+    """Return discovered PDFs and (path, reason) pairs for skipped directories."""
+    pdfs: list[Path] = []
+    skipped: list[tuple[str, str]] = []
+    visited_dirs = 0
+    stack = [root_path]
+    while stack and not cancel_event.is_set():
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    if cancel_event.is_set():
+                        break
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            directory = Path(entry.path)
+                            reason = "link" if is_link_or_junction(entry) else skip_reason(directory)
+                            if reason:
+                                skipped.append((entry.path, reason))
+                            else:
+                                stack.append(directory)
+                        elif entry.is_file(follow_symlinks=False):
+                            if entry.name.startswith("._"):
+                                continue
+                            if entry.name.casefold().endswith(".pdf"):
+                                pdfs.append(Path(entry.path))
+                    except OSError:
+                        # Individual entries can disappear or become inaccessible mid-scan.
+                        continue
+        except OSError:
+            if current == root_path:
+                raise
+            skipped.append((str(current), "access"))
+        visited_dirs += 1
+        if visited_dirs % 20 == 0:
+            emit_progress(len(pdfs), visited_dirs, len(skipped))
+    emit_progress(len(pdfs), visited_dirs, len(skipped))
+    return pdfs, skipped
+
+
+def bounded_map(fn: Callable[[Any], Any], items: Iterable[Any], cancel_event: threading.Event,
+                on_result: Callable[[Any, Any, BaseException | None], None], *,
+                timeout: float | None = None, name: str = "PDFWorker") -> bool:
+    """Run fn over items on MAX_SCAN_WORKERS threads, keeping at most MAX_IN_FLIGHT tasks queued.
+
+    on_result(item, result, error) runs on the calling thread. A task that runs longer than
+    timeout seconds is reported with a TimeoutError and abandoned: its thread finishes in the
+    background while queued work moves to a fresh pool. Returns False when cancelled; cancelling
+    does not wait for running tasks.
+    """
+    max_in_flight = MAX_SCAN_WORKERS * MAX_IN_FLIGHT_PER_WORKER
+    source = iter(items)
+    executor = ThreadPoolExecutor(max_workers=MAX_SCAN_WORKERS, thread_name_prefix=name)
+    pending: dict[Future[Any], tuple[Any, list[float | None]]] = {}
+
+    def submit(item: Any) -> None:
+        started: list[float | None] = [None]
+
+        def run() -> Any:
+            started[0] = time.monotonic()
+            return fn(item)
+
+        pending[executor.submit(run)] = (item, started)
+
+    def fill() -> None:
+        while len(pending) < max_in_flight and not cancel_event.is_set():
+            try:
+                item = next(source)
+            except StopIteration:
+                return
+            submit(item)
+
+    try:
+        fill()
+        while pending:
+            if cancel_event.is_set():
+                return False
+            finished, _ = wait(pending, timeout=0.5 if timeout is not None else None,
+                               return_when=FIRST_COMPLETED)
+            for future in finished:
+                item, _started = pending.pop(future)
+                try:
+                    result, error = future.result(), None
+                except Exception as exc:  # Reported to the caller, which decides how to record it.
+                    result, error = None, exc
+                on_result(item, result, error)
+            if timeout is not None:
+                now = time.monotonic()
+                stuck = [future for future, (_item, started) in pending.items()
+                         if started[0] is not None and now - started[0] > timeout and not future.done()]
+                if stuck:
+                    for future in stuck:
+                        item, _started = pending.pop(future)
+                        on_result(item, None, TimeoutError(f"Timed out after {timeout:g} s"))
+                    requeue = [pending.pop(future)[0] for future in list(pending) if future.cancel()]
+                    executor.shutdown(wait=False)
+                    executor = ThreadPoolExecutor(max_workers=MAX_SCAN_WORKERS, thread_name_prefix=name)
+                    for item in requeue:
+                        submit(item)
+            fill()
+        return not cancel_event.is_set()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def scan_folder(root_path: Path, cancel_event: threading.Event, emit: Callable[[str, Any], None]) -> None:
+    """Discover, inspect and compare the PDFs below root_path, reporting through emit(kind, payload).
+
+    Runs on a worker thread and never touches Tk. The last event is always ("done", summary).
+    """
+    summary: dict[str, Any] = {"cancelled": False, "skipped_dirs": 0, "skipped_folders": []}
+
+    def finish(cancelled: bool) -> None:
+        summary["cancelled"] = cancelled
+        emit("done", summary)
+
+    try:
+        pdf_paths, skipped_folders = discover_pdfs(
+            root_path, cancel_event,
+            lambda found, folders, skipped: emit("discovering", (found, folders, skipped)),
+        )
+        summary["skipped_dirs"] = len(skipped_folders)
+        summary["skipped_folders"] = skipped_folders
+        if cancel_event.is_set():
+            return finish(True)
+        total = len(pdf_paths)
+        emit("scan_total", total)
+        if total == 0:
+            return finish(False)
+
+        inspected: dict[str, dict[str, Any]] = {}
+        size_groups: dict[int, list[str]] = defaultdict(list)
+
+        def on_inspected(path: Path, record: dict[str, Any] | None, error: BaseException | None) -> None:
+            if record is None:
+                record = failed_record(path, str(error) or type(error).__name__)
+            inspected[record["path"]] = record
+            if record["size_bytes"] is not None:
+                size_groups[record["size_bytes"]].append(record["path"])
+            emit("file", dict(record))
+            emit("inspect_progress", (len(inspected), total))
+
+        if not bounded_map(inspect_pdf, pdf_paths, cancel_event, on_inspected,
+                           timeout=INSPECT_TIMEOUT_SECONDS, name="PDFInspect"):
+            return finish(True)
+
+        # Hard links share one file: hash only the first path and give the others its result.
+        hard_link_of: dict[str, str] = {}
+        candidates: list[dict[str, Any]] = []
+        for group in size_groups.values():
+            first_path_by_id: dict[Any, str] = {}
+            distinct: list[dict[str, Any]] = []
+            for path in group:
+                record = inspected[path]
+                file_id = record["file_id"]
+                if file_id is not None and file_id in first_path_by_id:
+                    hard_link_of[path] = first_path_by_id[file_id]
+                    continue
+                if file_id is not None:
+                    first_path_by_id[file_id] = path
+                distinct.append(record)
+            if len(distinct) > 1:
+                for record in distinct:
+                    record["duplicate"] = None
+                    candidates.append(record)
+                    emit("file_update", dict(record))
+
+        # Stage 1: a small partial hash narrows same-size files to likely matches.
+        quick_results: dict[str, str | None] = {}
+        if candidates:
+            emit("hash_stage", ("quick", len(candidates)))
+
+            def on_quick(record: dict[str, Any], value: str | None, error: BaseException | None) -> None:
+                quick_results[record["path"]] = None if error else value
+                emit("hash_progress", ("quick", len(quick_results), len(candidates)))
+
+            if not bounded_map(lambda rec: _quick_hash(Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"]),
+                               candidates, cancel_event, on_quick, name="PDFQuickHash"):
+                return finish(True)
+
+        likely_groups: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+        for record in candidates:
+            quick = quick_results.get(record["path"])
+            if quick:
+                likely_groups[(record["size_bytes"], quick)].append(record)
+        full_candidates = [rec for group in likely_groups.values() if len(group) > 1 for rec in group]
+
+        # Same-size files with different partial hashes are definitely not duplicates.
+        states: dict[str, bool | None] = {
+            rec["path"]: False if quick_results.get(rec["path"]) else None for rec in candidates
+        }
+        groups: dict[str, int] = {}
+        if full_candidates:
+            emit("hash_stage", ("full", len(full_candidates)))
+            full_results: dict[str, str | None] = {}
+
+            def on_full(record: dict[str, Any], value: str | None, error: BaseException | None) -> None:
+                full_results[record["path"]] = None if error else value
+                emit("hash_progress", ("full", len(full_results), len(full_candidates)))
+
+            if not bounded_map(
+                lambda rec: _full_hash(Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"], cancel_event),
+                full_candidates, cancel_event, on_full, name="PDFFullHash",
+            ):
+                return finish(True)
+
+            digest_groups: dict[str, list[str]] = defaultdict(list)
+            for path, digest in full_results.items():
+                if digest:
+                    digest_groups[digest].append(path)
+                else:
+                    states[path] = None
+            # Number groups by their first path so the same library gets the same group numbers.
+            matched = sorted((sorted(paths, key=str.casefold) for paths in digest_groups.values() if len(paths) > 1),
+                             key=lambda paths: paths[0].casefold())
+            for number, paths in enumerate(matched, start=1):
+                for path in paths:
+                    states[path] = True
+                    groups[path] = number
+
+        for path, first_path in hard_link_of.items():
+            states[path] = states.get(first_path, False)
+            if first_path in groups:
+                groups[path] = groups[first_path]
+        emit("duplicates", {"states": states, "groups": groups})
+        finish(cancel_event.is_set())
+    except Exception as exc:
+        logging.exception("Unexpected scanner failure")
+        summary["error"] = str(exc)
+        finish(cancel_event.is_set())
+
+
+# ---------- Filename cleaner ----------
+# Source tags that download sites append to PDF names. Only an exact tag at the very end of the
+# name is removed, so "Book (Z-Library)_compressed.pdf" is left alone.
+CLEANER_MARKER_SUFFIX = re.compile(
+    r"\s*\((?P<marker>z-library|z-library\.sk\s*,\s*1lib\.sk\s*,\s*z-lib\.sk)\)\s*$",
+    re.IGNORECASE,
+)
+RENAME_REPORT_HEADERS = ("Status", "Marker", "Source", "Destination", "Detail")
+
+
+@dataclass(frozen=True)
+class RenamePlan:
+    source: Path
+    destination: Path | None
+    marker: str | None
+    status: str
+    detail: str
+
+
+def cleaned_pdf_name(name: str) -> tuple[str, str] | None:
+    """Return the cleaned name and matched marker, or None when no safe match exists."""
+    path = Path(name)
+    if path.suffix.casefold() != ".pdf":
+        return None
+    match = CLEANER_MARKER_SUFFIX.search(path.stem)
+    if not match:
+        return None
+    cleaned_stem = CLEANER_MARKER_SUFFIX.sub("", path.stem).rstrip()
+    if not cleaned_stem:
+        return None
+    return cleaned_stem + path.suffix, match.group("marker")
+
+
+def plan_renames(pdf_paths: Iterable[Path]) -> list[RenamePlan]:
+    """Build a collision-safe rename preview for the supplied PDF paths."""
+    plans: list[RenamePlan] = []
+    for source in pdf_paths:
+        cleaned = cleaned_pdf_name(source.name)
+        if cleaned:
+            name, marker = cleaned
+            plans.append(RenamePlan(source, source.with_name(name), marker, "ready", "Ready to rename"))
+
+    by_destination: dict[str, int] = defaultdict(int)
+    for plan in plans:
+        by_destination[str(plan.destination).casefold()] += 1
+    return [
+        replace(plan, status="collision", detail="Another matched file has the same cleaned name")
+        if by_destination[str(plan.destination).casefold()] > 1 else plan
+        for plan in plans
+    ]
+
+
+def preflight_renames(plans: Iterable[RenamePlan]) -> list[RenamePlan]:
+    """Re-check ready plans against the disk so a preview shows what applying would do."""
+    checked: list[RenamePlan] = []
+    for plan in plans:
+        if plan.status == "ready" and plan.destination is not None:
+            if not plan.source.is_file():
+                plan = replace(plan, status="skipped", detail="Source file is no longer available")
+            elif plan.destination.exists():
+                plan = replace(plan, status="collision", detail="A file with the new name already exists")
+        checked.append(plan)
+    return checked
+
+
+def _move_without_overwrite(source: Path, destination: Path) -> None:
+    """Rename without replacing an existing destination or modifying file content."""
+    if os.name == "nt":
+        import ctypes
+
+        if ctypes.windll.kernel32.MoveFileW(str(source), str(destination)) == 0:  # type: ignore[attr-defined]
+            error = ctypes.windll.kernel32.GetLastError()  # type: ignore[attr-defined]
+            if error in {80, 183}:  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
+                raise FileExistsError(error, os.strerror(error), str(destination))
+            raise OSError(error, os.strerror(error), str(destination))
+        return
+
+    # A hard-link then unlink is an atomic no-overwrite move within one directory.
+    os.link(source, destination)
+    try:
+        os.unlink(source)
+    except OSError:
+        try:
+            os.unlink(destination)
+        except OSError:
+            pass
+        raise
+
+
+def apply_renames(plans: Iterable[RenamePlan],
+                  on_outcome: Callable[[RenamePlan], None] | None = None) -> list[RenamePlan]:
+    """Apply only ready plans and record all results without overwriting files."""
+    outcomes: list[RenamePlan] = []
+    for plan in preflight_renames(plans):
+        if plan.status == "ready" and plan.destination is not None:
+            try:
+                _move_without_overwrite(plan.source, plan.destination)
+            except FileExistsError:
+                plan = replace(plan, status="collision", detail="A file with the new name already exists")
+            except OSError as exc:
+                plan = replace(plan, status="error", detail=str(exc))
+            else:
+                plan = replace(plan, status="renamed", detail="Renamed safely")
+        outcomes.append(plan)
+        if on_outcome is not None:
+            on_outcome(plan)
+    return outcomes
+
+
+def _report_row(plan: RenamePlan) -> tuple[str, str, str, str, str]:
+    return plan.status, plan.marker or "", str(plan.source), str(plan.destination or ""), plan.detail
+
+
+def write_rename_report(destination: Path, plans: Iterable[RenamePlan]) -> None:
+    """Write an audit report that load_undo_plans can read back."""
+    write_csv_export(destination, RENAME_REPORT_HEADERS, (_report_row(plan) for plan in plans), ",")
+
+
+def default_report_path(directory: Path, prefix: str) -> Path:
+    """Return an unused, timestamped report path inside directory."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for index in range(1, 10_000):
+        suffix = "" if index == 1 else f"_{index}"
+        candidate = directory / f"{prefix}_{timestamp}{suffix}.csv"
+        if not candidate.exists():
+            return candidate
+    raise OSError("Could not allocate a unique report filename")
+
+
+def run_renames(plans: Sequence[RenamePlan], report_path: Path) -> tuple[list[RenamePlan], OSError | None]:
+    """Apply plans and record every outcome in report_path.
+
+    Raises OSError before renaming anything when the report cannot be created. Each outcome is
+    appended to the report as it happens, so a crash mid-run still leaves an undo record; the
+    complete report then replaces it. If the final report cannot be written, the renamed pairs
+    are logged and the error is returned.
+    """
+    write_rename_report(report_path, [])
+    journal_error: OSError | None = None
+    with report_path.open("a", encoding="utf-8", newline="") as journal:
+        writer = csv.writer(journal, lineterminator="\r\n")
+
+        def journal_outcome(plan: RenamePlan) -> None:
+            nonlocal journal_error
+            if journal_error is None:
+                try:
+                    writer.writerow([sanitize_csv_cell(value) for value in _report_row(plan)])
+                    journal.flush()
+                except OSError as exc:  # The final report below is still attempted.
+                    journal_error = exc
+
+        outcomes = apply_renames(plans, journal_outcome)
+    try:
+        write_rename_report(report_path, outcomes)
+    except OSError as exc:
+        for plan in outcomes:
+            if plan.status == "renamed":
+                logging.error("Renamed without a saved report: %s -> %s", plan.source, plan.destination)
+        return outcomes, exc
+    return outcomes, None
+
+
+def load_undo_plans(report_path: Path) -> tuple[list[RenamePlan], list[str]]:
+    """Load only validated completed renames from a cleanup report."""
+    plans: list[RenamePlan] = []
+    warnings: list[str] = []
+    try:
+        with report_path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if not reader.fieldnames or not set(RENAME_REPORT_HEADERS).issubset(reader.fieldnames):
+                return [], ["The report does not have the expected cleanup columns."]
+            for row_number, row in enumerate(reader, start=2):
+                if row.get("Status") != "renamed":
+                    continue
+                original = Path(row.get("Source") or "")
+                current = Path(row.get("Destination") or "")
+                cleaned = cleaned_pdf_name(original.name)
+                if (not original.is_absolute() or not current.is_absolute() or original.parent != current.parent
+                        or not cleaned or cleaned[0] != current.name):
+                    warnings.append(f"Ignored invalid report row {row_number}.")
+                    continue
+                plans.append(RenamePlan(current, original, row.get("Marker") or None,
+                                        "ready", "Ready to restore the original filename"))
+    except (OSError, csv.Error, UnicodeError) as exc:
+        return [], [f"Could not read report: {exc}"]
+    return plans, warnings
+
+
+# ---------- Application files, logging and window placement ----------
+def app_data_dir() -> Path:
+    """Per-user folder for settings, rename reports and the log file."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "PDFMasterSuite"
+
+
+def log_file_path() -> Path:
+    return app_data_dir() / "pdf_inventory.log"
+
+
+def configure_logging() -> None:
+    """Log warnings and errors to stderr (when there is one) and to a small rotating file."""
+    handlers: list[logging.Handler] = []
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler())
+    try:
+        log_file_path().parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(log_file_path(), maxBytes=512 * 1024, backupCount=1, encoding="utf-8"))
+    except OSError:
+        pass
+    logging.basicConfig(level=logging.WARNING, handlers=handlers,
+                        format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
+
+
+def virtual_screen_bounds(root: tk.Misc) -> tuple[int, int, int, int]:
+    """Return (left, top, right, bottom) of the desktop across all monitors."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            metrics = ctypes.windll.user32.GetSystemMetrics  # type: ignore[attr-defined]
+            left, top, width, height = metrics(76), metrics(77), metrics(78), metrics(79)  # SM_*VIRTUALSCREEN
+            if width > 0 and height > 0:
+                return left, top, left + width, top + height
+        except Exception:
+            pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+def geometry_is_visible(geometry: str, screen: tuple[int, int, int, int]) -> bool:
+    """True when a saved WxH+X+Y geometry fits the screen and its title bar can be reached."""
+    match = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", geometry)
+    if not match:
+        return False
+    width, height, x, y = map(int, match.groups())
+    left, top, right, bottom = screen
+    grab_x, grab_y = x + min(width, 120) // 2, y + 10
+    return (width <= right - left and height <= bottom - top
+            and left <= grab_x < right and top <= grab_y < bottom)
+
+
+def one_line(text: str, limit: int = 300) -> str:
+    """Collapse whitespace so multi-line parser errors fit in one table cell."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[:limit - 1] + "…"
 
 
 class PDFInventoryApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.settings_path = self._settings_path()
+        self.reports_dir = self.settings_path.parent / "rename_reports"
         self.settings = self._load_settings()
         saved_lang = self.settings.get("language")
         self.current_lang = saved_lang if saved_lang in TRANSLATIONS else self._get_system_language()
@@ -372,14 +960,19 @@ class PDFInventoryApp:
         if self.csv_separator not in {"auto", "comma", "semicolon", "tab"}:
             self.csv_separator = "auto"
         self.last_export_dir = self.settings.get("last_export_dir", self.target_directory)
+        # Records stay in arrival order; the unsorted table shows them in this order.
         self.records: dict[str, dict[str, Any]] = {}
-        self._insertion_order: list[str] = []
+        # Normalized (search text, name, folder, path) per record, rebuilt when a record changes.
+        self._search_keys: dict[str, tuple[str, str, str, str]] = {}
         self._iid_by_path: dict[str, str] = {}
         self._path_by_iid: dict[str, str] = {}
+        self._row_stripe: dict[str, str] = {}
         self._pending_render_paths: list[str] = []
         self._pending_render_set: set[str] = set()
         self._table_mode: tuple[str, str | None, bool, bool] | None = None
         self._visible_paths: list[str] = []
+        self._last_full_refresh = 0.0
+        self._refresh_pending = False
         self._queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=MAX_UI_QUEUE_EVENTS)
         self._cancel_event = threading.Event()
         self._scan_thread: threading.Thread | None = None
@@ -387,10 +980,9 @@ class PDFInventoryApp:
         self._closing = False
         self._search_after_id: str | None = None
         self._last_status: tuple[str, dict[str, Any]] = ("status_ready", {})
-        self._scan_progress = 0
-        self._scan_total = 0
         self._skipped_dirs = 0
         self._skipped_folders: list[tuple[str, str]] = []
+        self._rename_dialog: tk.Toplevel | None = None
         self._sort_column: str | None = None
         self._sort_reverse = False
         self.duplicates_only_var = tk.BooleanVar(value=False)
@@ -398,23 +990,16 @@ class PDFInventoryApp:
 
         self._setup_window()
         self._setup_styles()
+        self._setup_menu()
         self._setup_ui()
         self._update_language()
         self._set_status("status_ready")
-        if not PYPDF_AVAILABLE:
-            self._append_library_warning()
         self.root.after(100, self._poll_worker_queue)
 
     # ---------- Paths and settings ----------
     @staticmethod
     def _settings_path() -> Path:
-        if sys.platform == "win32":
-            base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-        elif sys.platform == "darwin":
-            base = Path.home() / "Library" / "Application Support"
-        else:
-            base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-        return base / "PDFMasterSuite" / "settings.json"
+        return app_data_dir() / "settings.json"
 
     @staticmethod
     def _load_settings() -> dict[str, Any]:
@@ -498,7 +1083,8 @@ class PDFInventoryApp:
         width, height = self._px(1180), self._px(760)
         self.root.minsize(self._px(850), self._px(520))
         geometry = self.settings.get("geometry")
-        if isinstance(geometry, str) and re.fullmatch(r"\d+x\d+(?:[+-]\d+){2}", geometry):
+        # A saved position can be off-screen after a monitor is disconnected or rearranged.
+        if isinstance(geometry, str) and geometry_is_visible(geometry, virtual_screen_bounds(self.root)):
             self.root.geometry(geometry)
         else:
             x = max(0, (self.root.winfo_screenwidth() - width) // 2)
@@ -545,6 +1131,22 @@ class PDFInventoryApp:
                       foreground=[("disabled", "#9299a3")])
         style.configure("TProgressbar", troughcolor="#171b21", background="#2c91e8",
                         bordercolor="#171b21", lightcolor="#2c91e8", darkcolor="#2c91e8")
+
+    def _setup_menu(self) -> None:
+        # Labels are set in _update_language; entry indices below are referenced there.
+        self.menubar = tk.Menu(self.root, tearoff=False)
+        self.file_menu = tk.Menu(self.menubar, tearoff=False)
+        self.file_menu.add_command(command=self._select_folder, accelerator="Ctrl+O")
+        self.file_menu.add_command(command=self._start_scan, accelerator="Ctrl+R")
+        self.file_menu.add_command(command=self._export_csv, accelerator="Ctrl+E")
+        self.file_menu.add_separator()
+        self.file_menu.add_command(command=self._on_close)
+        self.tools_menu = tk.Menu(self.menubar, tearoff=False)
+        self.tools_menu.add_command(command=self._open_filename_cleaner)
+        self.tools_menu.add_command(command=self._open_cleanup_undo)
+        self.menubar.add_cascade(menu=self.file_menu)
+        self.menubar.add_cascade(menu=self.tools_menu)
+        self.root.configure(menu=self.menubar)
 
     def _setup_ui(self) -> None:
         self.top_frame = ttk.Frame(self.root, style="Panel.TFrame", padding=(self._px(16), self._px(13)))
@@ -598,9 +1200,11 @@ class PDFInventoryApp:
 
         table_frame = ttk.Frame(self.root, style="TFrame", padding=(self._px(16), 0, self._px(16), self._px(10)))
         table_frame.pack(fill=tk.BOTH, expand=True)
-        self.columns = ("name", "folder", "size", "pages", "date", "duplicate", "path")
+        # Problem sits before the wide path column so a corruption reason is visible without scrolling.
+        self.columns = ("name", "folder", "size", "pages", "date", "duplicate", "problem", "path")
         self.tree = ttk.Treeview(table_frame, columns=self.columns, show="headings", selectmode="extended")
-        widths = {"name": 235, "folder": 150, "size": 92, "pages": 76, "date": 142, "duplicate": 105, "path": 390}
+        widths = {"name": 235, "folder": 150, "size": 92, "pages": 76, "date": 142, "duplicate": 130,
+                  "problem": 200, "path": 390}
         for column in self.columns:
             self.tree.column(column, width=self._px(widths[column]), minwidth=self._px(60),
                              anchor=tk.CENTER if column in {"size", "pages", "date", "duplicate"} else tk.W,
@@ -637,13 +1241,28 @@ class PDFInventoryApp:
         self._update_count_label()
 
     def _bind_shortcuts(self) -> None:
-        self.root.bind_all("<Control-f>", lambda _e: self._focus_search())
-        self.root.bind_all("<Control-o>", lambda _e: self._select_folder())
-        self.root.bind_all("<Control-r>", lambda _e: self._start_scan() if not self.is_scanning else self._cancel_scan())
-        self.root.bind_all("<Control-e>", lambda _e: self._export_csv())
-        self.root.bind_all("<Control-a>", self._select_all_visible)
-        self.root.bind_all("<Escape>", lambda _e: self._clear_search())
-        self.root.bind_all("<Control-Shift-c>", self._copy_selected_path)
+        def when_no_dialog(handler: Callable[[Any], Any]) -> Callable[[Any], Any]:
+            # bind_all also reaches widgets inside the modal rename dialog.
+            return lambda event: None if self._rename_dialog is not None else handler(event)
+
+        shortcuts: dict[str, Callable[[Any], Any]] = {
+            "f": lambda _e: self._focus_search(),
+            "o": lambda _e: self._select_folder(),
+            "r": lambda _e: self._start_scan(),
+            "e": lambda _e: self._export_csv(),
+            "a": self._select_all_visible,
+        }
+        self._shortcut_handlers: dict[str, Callable[[Any], Any]] = {}
+        for key, handler in shortcuts.items():
+            # Caps Lock turns the keysym upper-case, so bind both spellings.
+            for keysym in (key, key.upper()):
+                self._shortcut_handlers[f"<Control-{keysym}>"] = when_no_dialog(handler)
+        self._shortcut_handlers["<Escape>"] = when_no_dialog(lambda _e: self._clear_search())
+        # Shift+C reports keysym "C"; with Caps Lock on it reports "c".
+        for keysym in ("C", "c"):
+            self._shortcut_handlers[f"<Control-Shift-{keysym}>"] = when_no_dialog(self._copy_selected_path)
+        for sequence, handler in self._shortcut_handlers.items():
+            self.root.bind_all(sequence, handler)
 
     # ---------- Language, settings and status ----------
     def _update_language(self) -> None:
@@ -654,32 +1273,53 @@ class PDFInventoryApp:
         self.lbl_search.config(text=self._t("search"))
         self.btn_browse.config(text=self._t("browse"))
         self.btn_export.config(text=self._t("export"))
-        self.btn_scan.config(text=self._t("cancel_scan" if self.is_scanning else "scan"))
         self.btn_clear.config(text=self._t("clear"))
         self.duplicates_only.config(text=self._t("duplicates_only"))
         self.btn_skipped.config(text=self._t("skipped_button", count=len(self._skipped_folders)))
+        self.menubar.entryconfigure(0, label=self._t("menu_file"))
+        self.menubar.entryconfigure(1, label=self._t("menu_tools"))
+        self.file_menu.entryconfigure(0, label=self._t("menu_select_folder"))
+        self.file_menu.entryconfigure(2, label=self._t("export"))
+        self.file_menu.entryconfigure(4, label=self._t("menu_exit"))
+        self.tools_menu.entryconfigure(0, label=self._t("tool_clean"))
+        self.tools_menu.entryconfigure(1, label=self._t("tool_undo"))
         self.lang_combo.set("Türkçe" if self.current_lang == "tr" else "English")
         sep_keys = ("auto", "comma", "semicolon", "tab")
         self._separator_labels = {self._t("sep_" + key): key for key in sep_keys}
         self.separator_combo.configure(values=list(self._separator_labels.keys()))
         self.separator_combo.set(next(label for label, key in self._separator_labels.items() if key == self.csv_separator))
-        heading_keys = {
-            "name": "col_name", "folder": "col_folder", "size": "col_size", "pages": "col_pages",
-            "date": "col_date", "duplicate": "col_duplicate", "path": "col_path",
-        }
-        for column, key in heading_keys.items():
-            heading = self._t(key)
+        for column in self.columns:
+            heading = self._t("col_" + column)
             if self._sort_column == column:
                 heading += "  " + ("▼" if self._sort_reverse else "▲")
             self.tree.heading(column, text=heading)
+        self._update_action_states()
         self._render_last_status()
         self._update_count_label()
+
+    def _update_action_states(self) -> None:
+        """Enable or disable buttons and menu entries for the current scan state."""
+        idle = not self.is_scanning
+        has_rows = bool(self.records)
+        cancelling = self.is_scanning and self._cancel_event.is_set()
+        scan_label = self._t("cancel_scan" if self.is_scanning else "scan")
+        self.btn_scan.configure(text=scan_label, state=tk.DISABLED if cancelling else tk.NORMAL)
+        self.btn_browse.configure(state=tk.NORMAL if idle else tk.DISABLED)
+        self.btn_export.configure(state=tk.NORMAL if idle and has_rows else tk.DISABLED)
+        self.file_menu.entryconfigure(0, state=tk.NORMAL if idle else tk.DISABLED)
+        self.file_menu.entryconfigure(1, label=scan_label, state=tk.DISABLED if cancelling else tk.NORMAL)
+        self.file_menu.entryconfigure(2, state=tk.NORMAL if idle and has_rows else tk.DISABLED)
+        self.tools_menu.entryconfigure(0, state=tk.NORMAL if idle and has_rows else tk.DISABLED)
+        self.tools_menu.entryconfigure(1, state=tk.NORMAL if idle else tk.DISABLED)
 
     def _on_language_change(self, _event: Any = None) -> None:
         self.current_lang = "tr" if self.lang_combo.get() == "Türkçe" else "en"
         self._save_settings()
+        self._search_keys.clear()  # Page and duplicate labels are part of the search text.
+        for path in self.records:
+            self._mark_path_dirty(path)
         self._update_language()
-        self._queue_table_refresh(full=True)
+        self._refresh_table(full=True)
 
     def _on_separator_change(self, _event: Any = None) -> None:
         self.csv_separator = self._separator_labels.get(self.separator_combo.get(), "auto")
@@ -697,10 +1337,6 @@ class PDFInventoryApp:
         if not PYPDF_AVAILABLE and key in {"status_ready", "status_done", "status_cancelled", "status_no_pdf"}:
             text += self._t("status_missing_library")
         self.lbl_status.config(text=text)
-
-    def _append_library_warning(self) -> None:
-        # The warning is appended by _render_last_status so language switches remain in sync.
-        self._render_last_status()
 
     # ---------- Folder and scan controls ----------
     def _select_folder(self) -> None:
@@ -722,22 +1358,18 @@ class PDFInventoryApp:
             messagebox.showerror(self._t("msg_error"), self._t("msg_invalid_folder"))
             return
 
-        self.records.clear()
-        self._insertion_order.clear()
-        self._iid_by_path.clear()
-        self._path_by_iid.clear()
+        # Detached rows are not among get_children(), so forget every row this table created.
+        self._forget_rows(list(self._iid_by_path))
+        self.records = {}
+        self._search_keys.clear()
         self._pending_render_paths.clear()
         self._pending_render_set.clear()
         self._visible_paths.clear()
-        self.tree.delete(*self.tree.get_children())
         self.search_var.set("")
         self._table_mode = None
         self._sort_column = None
         self._sort_reverse = False
-        self._update_language()
         self._cancel_event = threading.Event()
-        self._scan_progress = 0
-        self._scan_total = 0
         self._skipped_dirs = 0
         self._skipped_folders = []
         self.btn_skipped.pack_forget()
@@ -745,276 +1377,20 @@ class PDFInventoryApp:
         self.progress.configure(mode="indeterminate", maximum=100)
         self.progress.start(12)
         self.is_scanning = True
-        self.btn_scan.configure(text=self._t("cancel_scan"))
-        self.btn_browse.configure(state=tk.DISABLED)
-        self.lang_combo.configure(state="readonly")
-        self.btn_export.configure(state=tk.DISABLED)
+        self._update_language()
         self._set_status("status_discovering", files=0, folders=0)
         self._scan_thread = threading.Thread(target=self._scan_worker, args=(root_path,), daemon=True,
                                              name="PDFInventoryScanner")
         self._scan_thread.start()
 
     def _cancel_scan(self) -> None:
-        if self.is_scanning:
+        if self.is_scanning and not self._cancel_event.is_set():
             self._cancel_event.set()
-            self.btn_scan.configure(state=tk.DISABLED)
+            self._update_action_states()
             self._set_status("status_cancelling")
 
-    @staticmethod
-    def _discover_pdfs(root_path: Path, cancel_event: threading.Event,
-                       emit_progress: Any) -> tuple[list[Path], list[tuple[str, str]]]:
-        """Return discovered PDFs and (path, reason) pairs for skipped directories."""
-        pdfs: list[Path] = []
-        skipped: list[tuple[str, str]] = []
-        visited_dirs = 0
-        stack = [root_path]
-        while stack and not cancel_event.is_set():
-            current = stack.pop()
-            try:
-                with os.scandir(current) as entries:
-                    for entry in entries:
-                        if cancel_event.is_set():
-                            break
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                directory = Path(entry.path)
-                                reason = "link" if is_link_or_junction(entry) else skip_reason(directory)
-                                if reason:
-                                    skipped.append((entry.path, reason))
-                                else:
-                                    stack.append(directory)
-                            elif entry.is_file(follow_symlinks=False):
-                                if entry.name.startswith("._"):
-                                    continue
-                                if entry.name.casefold().endswith(".pdf"):
-                                    pdfs.append(Path(entry.path))
-                        except OSError:
-                            # Individual entries can disappear or become inaccessible mid-scan.
-                            continue
-            except OSError:
-                if current == root_path:
-                    raise
-                skipped.append((str(current), "access"))
-            visited_dirs += 1
-            if visited_dirs % 20 == 0:
-                emit_progress(len(pdfs), visited_dirs, len(skipped))
-        emit_progress(len(pdfs), visited_dirs, len(skipped))
-        return pdfs, skipped
-
     def _scan_worker(self, root_path: Path) -> None:
-        summary: dict[str, Any] = {"cancelled": False, "skipped_dirs": 0, "skipped_folders": []}
-        try:
-            pdf_paths, skipped_folders = self._discover_pdfs(
-                root_path, self._cancel_event,
-                lambda found, folders, skipped: self._queue.put(("discovering", (found, folders, skipped))),
-            )
-            summary["skipped_dirs"] = len(skipped_folders)
-            summary["skipped_folders"] = skipped_folders
-            if self._cancel_event.is_set():
-                summary["cancelled"] = True
-                self._queue.put(("done", summary))
-                return
-
-            total = len(pdf_paths)
-            self._queue.put(("scan_total", total))
-            if total == 0:
-                self._queue.put(("done", summary))
-                return
-
-            max_workers = MAX_SCAN_WORKERS
-            max_in_flight = max_workers * MAX_IN_FLIGHT_PER_WORKER
-            inspected: dict[str, dict[str, Any]] = {}
-            size_groups: dict[int, list[Path]] = defaultdict(list)
-            completed = 0
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="PDFInspect") as executor:
-                paths = iter(pdf_paths)
-                pending: dict[Any, Path] = {}
-                for _ in range(min(max_in_flight, total)):
-                    path = next(paths)
-                    pending[executor.submit(inspect_pdf, path)] = path
-                while pending:
-                    if self._cancel_event.is_set():
-                        for future in pending:
-                            future.cancel()
-                        break
-                    finished, _ = wait(pending, return_when=FIRST_COMPLETED)
-                    for future in finished:
-                        path = pending.pop(future)
-                        if self._cancel_event.is_set():
-                            for queued in pending:
-                                queued.cancel()
-                            break
-                        try:
-                            record = future.result()
-                        except Exception as exc:  # Defensive boundary for unexpected worker failures.
-                            record = {
-                                "path": str(path), "name": path.name, "folder": path.parent.name,
-                                "size_bytes": None, "mtime": None, "mtime_ns": None, "pages": None,
-                                "page_state": "unreadable", "duplicate": False, "quick_hash": None,
-                                "error": str(exc), "file_id": None,
-                            }
-                        inspected[str(path)] = record
-                        if record.get("size_bytes") is not None:
-                            size_groups[record["size_bytes"]].append(path)
-                        self._queue.put(("file", dict(record)))
-                        completed += 1
-                        self._queue.put(("inspect_progress", (completed, total)))
-                    if self._cancel_event.is_set():
-                        break
-                    while len(pending) < max_in_flight:
-                        try:
-                            path = next(paths)
-                        except StopIteration:
-                            break
-                        pending[executor.submit(inspect_pdf, path)] = path
-
-            if self._cancel_event.is_set():
-                summary["cancelled"] = True
-                self._queue.put(("done", summary))
-                return
-
-            # Hard links share one file: hash only the first path and give the others its result.
-            hard_link_of: dict[str, str] = {}
-            candidates: list[dict[str, Any]] = []
-            for group in size_groups.values():
-                first_path_by_id: dict[Any, str] = {}
-                distinct: list[dict[str, Any]] = []
-                for path in group:
-                    record = inspected.get(str(path))
-                    if not record or record.get("size_bytes") is None:
-                        continue
-                    file_id = record.get("file_id")
-                    if file_id is not None and file_id in first_path_by_id:
-                        hard_link_of[record["path"]] = first_path_by_id[file_id]
-                        continue
-                    if file_id is not None:
-                        first_path_by_id[file_id] = record["path"]
-                    distinct.append(record)
-                if len(distinct) > 1:
-                    for record in distinct:
-                        record["duplicate"] = None
-                        candidates.append(record)
-                        self._queue.put(("file_update", dict(record)))
-
-            # Stage 1: a small partial hash narrows same-size files to likely matches.
-            quick_results: dict[str, str | None] = {}
-            if candidates:
-                self._queue.put(("hash_stage", ("quick", len(candidates))))
-                quick_done = 0
-                with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="PDFQuickHash") as executor:
-                    records = iter(candidates)
-                    futures: dict[Any, dict[str, Any]] = {}
-                    for _ in range(min(max_in_flight, len(candidates))):
-                        rec = next(records)
-                        futures[executor.submit(_quick_hash, Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"])] = rec
-                    while futures:
-                        if self._cancel_event.is_set():
-                            for pending in futures:
-                                pending.cancel()
-                            break
-                        finished, _ = wait(futures, return_when=FIRST_COMPLETED)
-                        for future in finished:
-                            rec = futures.pop(future)
-                            if self._cancel_event.is_set():
-                                for pending in futures:
-                                    pending.cancel()
-                                break
-                            try:
-                                value = future.result()
-                            except OSError:
-                                value = None
-                            quick_results[rec["path"]] = value
-                            quick_done += 1
-                            self._queue.put(("hash_progress", ("quick", quick_done, len(candidates))))
-                        while not self._cancel_event.is_set() and len(futures) < max_in_flight:
-                            try:
-                                rec = next(records)
-                            except StopIteration:
-                                break
-                            futures[executor.submit(_quick_hash, Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"])] = rec
-                if self._cancel_event.is_set():
-                    summary["cancelled"] = True
-                    self._queue.put(("done", summary))
-                    return
-
-            likely_groups: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
-            for rec in candidates:
-                quick = quick_results.get(rec["path"])
-                if quick:
-                    likely_groups[(rec["size_bytes"], quick)].append(rec)
-            full_candidates = [rec for group in likely_groups.values() if len(group) > 1 for rec in group]
-
-            # Same-size files with different partial hashes are definitely not duplicates.
-            duplicate_states: dict[str, bool | None] = {rec["path"]: False for rec in candidates}
-            for rec in candidates:
-                if quick_results.get(rec["path"]) is None:
-                    duplicate_states[rec["path"]] = None
-
-            if full_candidates:
-                self._queue.put(("hash_stage", ("full", len(full_candidates))))
-                full_results: dict[str, str | None] = {}
-                full_done = 0
-                with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="PDFFullHash") as executor:
-                    records = iter(full_candidates)
-                    futures: dict[Any, dict[str, Any]] = {}
-                    for _ in range(min(max_in_flight, len(full_candidates))):
-                        rec = next(records)
-                        futures[executor.submit(_full_hash, Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"], self._cancel_event)] = rec
-                    while futures:
-                        if self._cancel_event.is_set():
-                            for pending in futures:
-                                pending.cancel()
-                            break
-                        finished, _ = wait(futures, return_when=FIRST_COMPLETED)
-                        for future in finished:
-                            rec = futures.pop(future)
-                            if self._cancel_event.is_set():
-                                for pending in futures:
-                                    pending.cancel()
-                                break
-                            try:
-                                value = future.result()
-                            except OSError:
-                                value = None
-                            full_results[rec["path"]] = value
-                            full_done += 1
-                            self._queue.put(("hash_progress", ("full", full_done, len(full_candidates))))
-                        while not self._cancel_event.is_set() and len(futures) < max_in_flight:
-                            try:
-                                rec = next(records)
-                            except StopIteration:
-                                break
-                            futures[executor.submit(_full_hash, Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"], self._cancel_event)] = rec
-                if self._cancel_event.is_set():
-                    summary["cancelled"] = True
-                    self._queue.put(("done", summary))
-                    return
-
-                digest_groups: dict[str, list[str]] = defaultdict(list)
-                for path, digest in full_results.items():
-                    if digest:
-                        digest_groups[digest].append(path)
-                    else:
-                        duplicate_states[path] = None
-                for same_content_paths in digest_groups.values():
-                    if len(same_content_paths) > 1:
-                        for path in same_content_paths:
-                            duplicate_states[path] = True
-
-            for path, first_path in hard_link_of.items():
-                duplicate_states[path] = duplicate_states.get(first_path, False)
-            for path, state in duplicate_states.items():
-                record = inspected.get(path)
-                if record:
-                    record["duplicate"] = state
-            self._queue.put(("duplicates", duplicate_states))
-            summary["cancelled"] = self._cancel_event.is_set()
-            self._queue.put(("done", summary))
-        except Exception as exc:
-            logging.exception("Unexpected scanner failure")
-            summary["error"] = str(exc)
-            summary["cancelled"] = self._cancel_event.is_set()
-            self._queue.put(("done", summary))
+        scan_folder(root_path, self._cancel_event, lambda kind, payload: self._queue.put((kind, payload)))
 
     def _poll_worker_queue(self) -> None:
         if self._closing:
@@ -1034,22 +1410,13 @@ class PDFInventoryApp:
             elif kind == "scan_total":
                 self.progress.stop()
                 self.progress.configure(mode="determinate", maximum=max(1, payload), value=0)
-                self._scan_total = payload
                 self._set_status("status_scanning", current=0, total=payload)
             elif kind in {"file", "file_update"}:
-                record = payload
-                path = record["path"]
-                if path not in self.records:
-                    self._insertion_order.append(path)
-                self.records[path] = record
-                self._mark_path_dirty(path)
+                self._store_record(payload)
                 changed = True
-                if len(self.records) > 0:
-                    self.btn_export.configure(state=tk.NORMAL)
             elif kind == "inspect_progress":
                 current, total = payload
                 self.progress.configure(value=current, maximum=max(1, total))
-                self._scan_progress = current
                 self._set_status("status_scanning", current=current, total=total)
             elif kind == "hash_stage":
                 stage, total = payload
@@ -1062,30 +1429,40 @@ class PDFInventoryApp:
                 self._set_status("status_hashing_quick" if stage == "quick" else "status_hashing_full",
                                  current=current, total=total)
             elif kind == "duplicates":
-                for path, state in payload.items():
-                    if path in self.records:
-                        self.records[path]["duplicate"] = state
+                groups = payload["groups"]
+                for path, state in payload["states"].items():
+                    record = self.records.get(path)
+                    if record:
+                        record["duplicate"] = state
+                        record["duplicate_group"] = groups.get(path)
+                        self._search_keys.pop(path, None)
                         self._mark_path_dirty(path)
                 changed = True
-            elif kind == "worker_error":
-                self._set_status("status_scan_error", error=payload)
             elif kind == "done":
                 self._finish_scan(payload)
                 changed = True
-        if changed:
-            self._refresh_table()
-        self._update_count_label()
+        if changed or self._refresh_pending:
+            # While scanning, sorted or filtered views rebuild at most once per interval.
+            self._refresh_table(throttle=self.is_scanning)
         self.root.after(100, self._poll_worker_queue)
+
+    def _store_record(self, record: dict[str, Any]) -> None:
+        path = record["path"]
+        self.records[path] = record
+        self._search_keys.pop(path, None)
+        self._mark_path_dirty(path)
 
     def _finish_scan(self, summary: dict[str, Any]) -> None:
         self.is_scanning = False
         self.progress.stop()
         self.progress.configure(mode="determinate", maximum=100)
         self.progress.configure(value=100 if self.records else 0)
-        self.btn_scan.configure(state=tk.NORMAL, text=self._t("scan"))
-        self.btn_browse.configure(state=tk.NORMAL)
-        self.lang_combo.configure(state="readonly")
-        self.btn_export.configure(state=tk.NORMAL if self.records else tk.DISABLED)
+        self._update_action_states()
+        # "Checking…" becomes "Unknown" once the scan ends, which changes the cell and search text.
+        for path, record in self.records.items():
+            if record.get("duplicate") is None:
+                self._search_keys.pop(path, None)
+                self._mark_path_dirty(path)
         self._skipped_dirs = int(summary.get("skipped_dirs", self._skipped_dirs))
         self._skipped_folders = list(summary.get("skipped_folders", []))
         if self._skipped_folders:
@@ -1093,7 +1470,7 @@ class PDFInventoryApp:
             # Packed before the status label so a long status message cannot squeeze it out.
             self.btn_skipped.pack(side=tk.RIGHT, padx=(self._px(12), 0), before=self.lbl_status)
         count = len(self.records)
-        duplicates = sum(1 for rec in self.records.values() if rec.get("duplicate") is True)
+        duplicates, groups, reclaimable = self._duplicate_summary()
         corrupt = sum(1 for rec in self.records.values() if rec.get("page_state") == "corrupt")
         errors = sum(1 for rec in self.records.values() if rec.get("page_state") == "unreadable")
         if summary.get("error"):
@@ -1103,9 +1480,25 @@ class PDFInventoryApp:
         elif count == 0:
             self._set_status("status_no_pdf")
         else:
-            self._set_status("status_done", count=count, duplicates=duplicates, corrupt=corrupt,
+            self._set_status("status_done", count=count, duplicates=duplicates, groups=groups,
+                             reclaimable=self._format_size(reclaimable), corrupt=corrupt,
                              errors=errors, skipped=self._skipped_dirs)
         self._save_settings()
+
+    def _duplicate_summary(self) -> tuple[int, int, int]:
+        """Return duplicate files, duplicate groups and bytes freed by keeping one copy per group."""
+        members: dict[int, set[Any]] = defaultdict(set)
+        sizes: dict[int, int] = {}
+        duplicates = 0
+        for record in self.records.values():
+            group = record.get("duplicate_group")
+            if record.get("duplicate") is True and group is not None:
+                duplicates += 1
+                # Hard links share storage, so they count once toward reclaimable space.
+                members[group].add(record.get("file_id") or record["path"])
+                sizes[group] = record.get("size_bytes") or 0
+        reclaimable = sum(sizes[group] * (len(files) - 1) for group, files in members.items())
+        return duplicates, len(members), reclaimable
 
     def _show_skipped_folders(self) -> None:
         limit = 40
@@ -1121,11 +1514,6 @@ class PDFInventoryApp:
             self._pending_render_paths.append(path)
             self._pending_render_set.add(path)
 
-    def _queue_table_refresh(self, full: bool = False) -> None:
-        if full:
-            self._table_mode = None
-        self._refresh_table()
-
     def _on_search_changed(self, *_args: Any) -> None:
         if self._search_after_id:
             try:
@@ -1136,8 +1524,7 @@ class PDFInventoryApp:
 
     def _apply_search(self) -> None:
         self._search_after_id = None
-        self._queue_table_refresh(full=True)
-        self._update_count_label()
+        self._refresh_table(full=True)
 
     def _clear_search(self) -> None:
         if self.search_var.get():
@@ -1154,8 +1541,21 @@ class PDFInventoryApp:
         else:
             self._sort_column = column
             self._sort_reverse = False
-        self._queue_table_refresh(full=True)
+        self._refresh_table(full=True)
         self._update_language()
+
+    def _search_entry(self, record: dict[str, Any]) -> tuple[str, str, str, str]:
+        path = record["path"]
+        entry = self._search_keys.get(path)
+        if entry is None:
+            name = normalize_search(record.get("name", ""))
+            folder = normalize_search(record.get("folder", ""))
+            full_path = normalize_search(path)
+            labels = normalize_search(" ".join((self._page_display(record), self._duplicate_display(record),
+                                                self._problem_display(record))))
+            entry = (" ".join((name, folder, full_path, labels)), name, folder, full_path)
+            self._search_keys[path] = entry
+        return entry
 
     def _sort_value(self, record: dict[str, Any], column: str) -> Any:
         if column == "size":
@@ -1166,82 +1566,102 @@ class PDFInventoryApp:
             return record.get("mtime") if record.get("mtime") is not None else -1
         if column == "duplicate":
             state = record.get("duplicate")
-            return -1 if state is None else int(bool(state))
-        if column == "folder":
-            return normalize_search(record.get("folder", ""))
-        if column == "path":
-            return normalize_search(record.get("path", ""))
-        return normalize_search(record.get("name", ""))
+            if state is None:
+                return (-1, 0)
+            # Sorting by group keeps the copies of each file next to each other.
+            return (1, record.get("duplicate_group") or 0) if state else (0, 0)
+        if column == "problem":
+            return normalize_search(self._problem_display(record))
+        _text, name, folder, full_path = self._search_entry(record)
+        return {"folder": folder, "path": full_path}.get(column, name)
 
     def _filtered_records(self) -> list[dict[str, Any]]:
         query = normalize_search(self.search_var.get().strip())
-        records = list(self.records.values())
+        records: list[dict[str, Any]] = list(self.records.values())
         if self.duplicates_only_var.get():
             records = [rec for rec in records if rec.get("duplicate") is True]
         if query:
-            records = [rec for rec in records if query in normalize_search(
-                " ".join((rec.get("name", ""), rec.get("folder", ""), rec.get("path", ""),
-                          self._page_display(rec), self._duplicate_display(rec)))
-            )]
+            records = [rec for rec in records if query in self._search_entry(rec)[0]]
         if self._sort_column:
-            records.sort(key=lambda rec: (self._sort_value(rec, self._sort_column), normalize_search(rec.get("path", ""))),
+            column = self._sort_column
+            records.sort(key=lambda rec: (self._sort_value(rec, column), self._search_entry(rec)[3]),
                          reverse=self._sort_reverse)
-        else:
-            order = {path: index for index, path in enumerate(self._insertion_order)}
-            records.sort(key=lambda rec: order.get(rec["path"], 0))
         return records
 
     def _on_filter_changed(self) -> None:
-        self._queue_table_refresh(full=True)
-        self._update_count_label()
+        self._refresh_table(full=True)
 
-    def _refresh_table(self) -> None:
+    def _refresh_table(self, full: bool = False, throttle: bool = False) -> None:
+        """Update changed rows, then show the visible rows in order.
+
+        Each record gets one tree item, created once and rebuilt only when the record changes.
+        Searching, sorting and filtering only re-order or detach existing items.
+        """
         query = normalize_search(self.search_var.get().strip())
         mode = (query, self._sort_column, self._sort_reverse, self.duplicates_only_var.get())
-        selected_paths = {self._path_by_iid[iid] for iid in self.tree.selection() if iid in self._path_by_iid}
-        incremental = not query and self._sort_column is None and self._table_mode == mode
+        # Only the plain arrival-order view can append new rows in place.
+        incremental = not full and mode == ("", None, False, False) and self._table_mode == mode
+        reorder_now = not incremental and not (
+            throttle and time.monotonic() - self._last_full_refresh < SCAN_TABLE_REFRESH_SECONDS)
+
+        dirty = self._pending_render_paths
+        self._pending_render_paths = []
+        self._pending_render_set.clear()
+        added: list[str] = []
+        for path in dirty:
+            record = self.records.get(path)
+            if record is None:
+                continue
+            iid = self._iid_for_path(path)
+            values = self._row_values(record)
+            if self.tree.exists(iid):
+                self.tree.item(iid, values=values, tags=self._row_tags(record, self._row_stripe.get(iid, "even")))
+            else:
+                self.tree.insert("", tk.END, iid=iid, values=values, tags=self._row_tags(record, "even"))
+                self._row_stripe[iid] = "even"
+                added.append(iid)
+
         if incremental:
-            pending = self._pending_render_paths
-            self._pending_render_paths = []
-            self._pending_render_set.clear()
-            for path in pending:
-                record = self.records.get(path)
-                if not record:
-                    continue
-                iid = self._iid_for_path(path)
-                already_visible = self.tree.exists(iid)
-                if mode[3] and record.get("duplicate") is not True:
-                    if already_visible:
-                        self.tree.delete(iid)
-                        self._path_by_iid.pop(iid, None)
-                        self._visible_paths.remove(path)
-                    continue
-                values = self._row_values(record)
-                tags = self._row_tags(record, len(self._iid_by_path))
-                if already_visible:
-                    self.tree.item(iid, values=values, tags=tags)
-                else:
-                    self.tree.insert("", tk.END, iid=iid, values=values, tags=tags)
-                    self._visible_paths.append(path)
-        else:
+            self._visible_paths.extend(self._path_by_iid[iid] for iid in added)
+        elif reorder_now:
             visible = self._filtered_records()
-            self.tree.delete(*self.tree.get_children())
-            self._iid_by_path.clear()
-            self._path_by_iid.clear()
-            self._visible_paths = []
-            for index, record in enumerate(visible):
-                path = record["path"]
-                iid = self._iid_for_path(path)
-                self.tree.insert("", tk.END, iid=iid, values=self._row_values(record), tags=self._row_tags(record, index))
-                self._iid_by_path[path] = iid
-                self._path_by_iid[iid] = path
-                self._visible_paths.append(path)
-                if path in selected_paths:
-                    self.tree.selection_add(iid)
-            self._pending_render_paths.clear()
-            self._pending_render_set.clear()
+            visible_iids = [self._iid_for_path(record["path"]) for record in visible]
+            self.tree.set_children("", *visible_iids)
+            self._visible_paths = [record["path"] for record in visible]
+            self._last_full_refresh = time.monotonic()
+            selection = self.tree.selection()
+            if selection:
+                shown = set(visible_iids)
+                kept = [iid for iid in selection if iid in shown]
+                if len(kept) != len(selection):
+                    self.tree.selection_set(kept)
+        else:
+            # Throttled during a scan: keep new rows hidden until the next re-ordering pass.
+            if added:
+                self.tree.detach(*added)
+            self._refresh_pending = True
+            return
+        self._refresh_pending = False
+        self._restripe()
         self._table_mode = mode
         self._update_count_label()
+
+    def _restripe(self) -> None:
+        """Alternate row backgrounds by position, retagging only rows whose stripe changed."""
+        for index, path in enumerate(self._visible_paths):
+            iid = self._iid_by_path[path]
+            stripe = "even" if index % 2 == 0 else "odd"
+            if self._row_stripe.get(iid) != stripe:
+                self._row_stripe[iid] = stripe
+                self.tree.item(iid, tags=self._row_tags(self.records[path], stripe))
+
+    def _forget_rows(self, paths: Iterable[str]) -> None:
+        iids = [self._iid_by_path.pop(path) for path in paths if path in self._iid_by_path]
+        for iid in iids:
+            self._path_by_iid.pop(iid, None)
+            self._row_stripe.pop(iid, None)
+        if iids:
+            self.tree.delete(*iids)
 
     def _iid_for_path(self, path: str) -> str:
         iid = self._iid_by_path.get(path)
@@ -1252,8 +1672,8 @@ class PDFInventoryApp:
         self._path_by_iid[iid] = path
         return iid
 
-    def _row_tags(self, record: dict[str, Any], index: int) -> tuple[str, ...]:
-        tags = ["even" if index % 2 == 0 else "odd"]
+    def _row_tags(self, record: dict[str, Any], stripe: str) -> tuple[str, ...]:
+        tags = [stripe]
         state = record.get("page_state")
         if state == "corrupt":
             tags.append("corrupted")
@@ -1287,10 +1707,15 @@ class PDFInventoryApp:
     def _duplicate_display(self, record: dict[str, Any]) -> str:
         state = record.get("duplicate")
         if state is True:
-            return self._t("yes")
+            group = record.get("duplicate_group")
+            return self._t("dup_group", group=group) if group else self._t("yes")
         if state is False:
             return self._t("no")
         return self._t("pending") if self.is_scanning else self._t("unknown")
+
+    def _problem_display(self, record: dict[str, Any]) -> str:
+        error = record.get("error")
+        return one_line(error) if error else ""
 
     def _row_values(self, record: dict[str, Any]) -> tuple[str, ...]:
         mtime = record.get("mtime")
@@ -1301,16 +1726,15 @@ class PDFInventoryApp:
         return (
             str(record.get("name", "")), str(record.get("folder", "")),
             self._format_size(record.get("size_bytes")), self._page_display(record), date_text,
-            self._duplicate_display(record), str(record.get("path", "")),
+            self._duplicate_display(record), self._problem_display(record), str(record.get("path", "")),
         )
 
     def _update_count_label(self) -> None:
         if not hasattr(self, "count_label"):
             return
-        visible = len(self._filtered_records()) if self._table_mode != (
-            "", None, False, self.duplicates_only_var.get()
-        ) else len(self._visible_paths)
-        self.count_label.config(text=self._t("count_label", visible=visible, total=len(self.records)))
+        # _visible_paths always mirrors the table, so counting it costs nothing on idle ticks.
+        self.count_label.config(text=self._t("count_label", visible=len(self._visible_paths),
+                                             total=len(self.records)))
 
     # ---------- Context actions and keyboard shortcuts ----------
     def _show_context_menu(self, event: Any) -> str:
@@ -1340,15 +1764,15 @@ class PDFInventoryApp:
     def _open_selected(self, _event: Any = None) -> str:
         paths = self._selected_paths()
         if paths:
-            self._open_path(paths[0])
+            self._open_path(paths[0], "msg_file_error")
         return "break"
 
     def _open_selected_folder(self) -> None:
         paths = self._selected_paths()
         if paths:
-            self._open_path(str(Path(paths[0]).parent))
+            self._open_path(str(Path(paths[0]).parent), "msg_folder_error")
 
-    def _open_path(self, path: str) -> None:
+    def _open_path(self, path: str, error_key: str) -> None:
         try:
             if sys.platform == "win32":
                 os.startfile(path)  # type: ignore[attr-defined]
@@ -1357,7 +1781,7 @@ class PDFInventoryApp:
             else:
                 subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError) as exc:
-            messagebox.showerror(self._t("msg_error"), self._t("msg_file_error", error=exc))
+            messagebox.showerror(self._t("msg_error"), self._t(error_key, error=exc))
 
     def _copy_selected_path(self, _event: Any = None) -> str:
         paths = self._selected_paths()
@@ -1381,6 +1805,9 @@ class PDFInventoryApp:
 
     # ---------- CSV export ----------
     def _export_csv(self) -> None:
+        # Mid-scan rows would still say "Checking…", so export waits for the scan to finish.
+        if self.is_scanning:
+            return
         visible_records = self._filtered_records()
         if not visible_records:
             messagebox.showwarning(self._t("msg_warning"), self._t("msg_no_data"))
@@ -1388,22 +1815,187 @@ class PDFInventoryApp:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_name = f"{self._t('filename_prefix')}_{timestamp}.csv"
         save_path = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            defaultextension=".csv", filetypes=[(self._t("csv_files"), "*.csv"), (self._t("all_files"), "*.*")],
             initialdir=self.last_export_dir, initialfile=default_name, title=self._t("choose_export"),
         )
         if not save_path:
             return
 
-        headers = [self._t("col_" + key) for key in self.columns]
+        # Exact bytes follow the display columns so spreadsheets can sort and sum sizes.
+        headers = [self._t("col_" + key) for key in self.columns] + [self._t("col_size_bytes")]
+        rows = (self._row_values(record) + (record["size_bytes"] if record.get("size_bytes") is not None else "",)
+                for record in visible_records)
         delimiter = resolve_csv_delimiter(self.csv_separator, self.current_lang)
         destination = Path(save_path)
         try:
-            write_csv_export(destination, headers, (self._row_values(record) for record in visible_records), delimiter)
+            write_csv_export(destination, headers, rows, delimiter)
             self.last_export_dir = str(destination.parent)
             self._save_settings()
             self._set_status("status_exported", count=len(visible_records), path=str(destination))
         except (OSError, csv.Error, UnicodeError) as exc:
             messagebox.showerror(self._t("msg_error"), self._t("msg_export_error", error=exc))
+
+    # ---------- Filename cleaner ----------
+    def _open_filename_cleaner(self) -> None:
+        if self.is_scanning or not self.records or self._rename_dialog is not None:
+            return
+        visible = self._filtered_records()
+        plans = preflight_renames(plan_renames(Path(record["path"]) for record in visible))
+        if not plans:
+            messagebox.showinfo(self._t("clean_title"), self._t("clean_none", total=len(visible)))
+            return
+        self._show_rename_preview(plans, "clean", self._t("clean_intro", total=len(visible)))
+
+    def _open_cleanup_undo(self) -> None:
+        if self.is_scanning or self._rename_dialog is not None:
+            return
+        initial = self.reports_dir if self.reports_dir.is_dir() else Path(self.target_directory)
+        selected = filedialog.askopenfilename(
+            initialdir=str(initial), title=self._t("choose_report"),
+            filetypes=[(self._t("csv_files"), "*.csv"), (self._t("all_files"), "*.*")],
+        )
+        if not selected:
+            return
+        report = Path(selected)
+        plans, warnings = load_undo_plans(report)
+        if not plans:
+            if warnings:
+                messagebox.showerror(self._t("msg_error"), self._t("undo_invalid", details="\n".join(warnings[:5])))
+            else:
+                messagebox.showinfo(self._t("undo_title"), self._t("undo_nothing"))
+            return
+        intro = self._t("undo_intro", report=report.name)
+        if warnings:
+            intro += " " + self._t("undo_ignored", count=len(warnings))
+        self._show_rename_preview(preflight_renames(plans), "undo", intro)
+
+    def _show_rename_preview(self, plans: list[RenamePlan], action: str, intro: str) -> tk.Toplevel:
+        """Show planned renames in a modal dialog; nothing changes until the apply button is pressed."""
+        ready = sum(1 for plan in plans if plan.status == "ready")
+        dialog = tk.Toplevel(self.root)
+        dialog.title(self._t("clean_title" if action == "clean" else "undo_title"))
+        dialog.configure(bg="#252a31")
+        dialog.transient(self.root)
+        dialog.minsize(self._px(640), self._px(360))
+        width, height = self._px(960), self._px(540)
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 3)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+        frame = ttk.Frame(dialog, style="Panel.TFrame", padding=self._px(14))
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text=intro, wraplength=width - self._px(40), justify=tk.LEFT).pack(
+            fill=tk.X, pady=(0, self._px(10)))
+
+        bottom = ttk.Frame(frame, style="Panel.TFrame")
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, pady=(self._px(10), 0))
+        table = ttk.Frame(frame, style="Panel.TFrame")
+        table.pack(fill=tk.BOTH, expand=True)
+        columns = ("status", "current", "new", "folder")
+        tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse")
+        widths = {"status": 130, "current": 320, "new": 280, "folder": 260}
+        for column in columns:
+            tree.heading(column, text=self._t("col_" + column))
+            tree.column(column, width=self._px(widths[column]), minwidth=self._px(80), anchor=tk.W,
+                        stretch=column != "status")
+        tree.tag_configure("blocked", foreground="#f0be67")
+        for index, plan in enumerate(plans):
+            stripe = "even" if index % 2 == 0 else "odd"
+            tags = (stripe,) if plan.status == "ready" else (stripe, "blocked")
+            tree.insert("", tk.END, values=(
+                self._t("rename_status_" + plan.status), plan.source.name,
+                plan.destination.name if plan.destination else "", self._folder_label(plan.source.parent),
+            ), tags=tags)
+        tree.tag_configure("even", background="#1b1f25")
+        tree.tag_configure("odd", background="#20252c")
+        scrollbar = ttk.Scrollbar(table, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Label(bottom, style="Muted.TLabel",
+                  text=self._t("rename_counts", ready=ready, blocked=len(plans) - ready)).pack(side=tk.LEFT)
+        apply_key = "clean_apply" if action == "clean" else "undo_apply"
+        apply_button = ttk.Button(bottom, style="Accent.TButton", text=self._t(apply_key, count=ready),
+                                  state=tk.NORMAL if ready else tk.DISABLED,
+                                  command=lambda: self._run_rename_plans(plans, action, dialog))
+        apply_button.pack(side=tk.RIGHT)
+        ttk.Button(bottom, style="Neutral.TButton", text=self._t("cancel"),
+                   command=lambda: self._close_rename_dialog(dialog)).pack(side=tk.RIGHT, padx=(0, self._px(8)))
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: self._close_rename_dialog(dialog))
+        dialog.bind("<Escape>", lambda _e: (self._close_rename_dialog(dialog), "break")[1])
+        self._rename_dialog = dialog
+        self._grab_when_viewable(dialog)
+        (apply_button if ready else tree).focus_set()
+        return dialog
+
+    def _grab_when_viewable(self, dialog: tk.Toplevel, attempts: int = 5) -> None:
+        # A grab fails until the window manager has shown the dialog; retry briefly.
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            if attempts > 1:
+                dialog.after(100, lambda: dialog.winfo_exists() and self._grab_when_viewable(dialog, attempts - 1))
+
+    def _folder_label(self, folder: Path) -> str:
+        """Show a folder relative to the scanned folder, where the meaningful part of its path is."""
+        root = Path(self.target_directory)
+        try:
+            relative = folder.relative_to(root)
+        except ValueError:
+            return str(folder)
+        return root.name if relative == Path(".") else str(relative)
+
+    def _close_rename_dialog(self, dialog: tk.Toplevel) -> None:
+        if self._rename_dialog is dialog:
+            self._rename_dialog = None
+        dialog.destroy()
+
+    def _run_rename_plans(self, plans: list[RenamePlan], action: str, dialog: tk.Toplevel) -> None:
+        prefix = "pdf_filename_cleaner" if action == "clean" else "pdf_filename_cleaner_undo"
+        dialog.configure(cursor="watch")
+        dialog.update_idletasks()
+        try:
+            report_path = default_report_path(self.reports_dir, prefix)
+            outcomes, report_error = run_renames(plans, report_path)
+        except OSError as exc:
+            dialog.configure(cursor="")
+            messagebox.showerror(self._t("msg_error"), self._t("msg_report_error", error=exc), parent=dialog)
+            return
+        self._close_rename_dialog(dialog)
+        self._apply_renamed_paths(outcomes)
+
+        renamed = sum(1 for plan in outcomes if plan.status == "renamed")
+        self._set_status("status_renamed" if action == "clean" else "status_restored", count=renamed)
+        if report_error is not None:
+            messagebox.showerror(self._t("msg_error"), self._t(
+                "msg_report_final_error", error=report_error, log=log_file_path()))
+            return
+        message = self._t("clean_done" if action == "clean" else "undo_done",
+                          renamed=renamed, total=len(outcomes), report=report_path)
+        if renamed < len(outcomes):
+            message += "\n\n" + self._t("rename_problems", count=len(outcomes) - renamed)
+        messagebox.showinfo(self._t("clean_title" if action == "clean" else "undo_title"), message)
+
+    def _apply_renamed_paths(self, outcomes: Iterable[RenamePlan]) -> None:
+        """Move renamed records to their new paths, keeping the table order."""
+        moved = {str(plan.source): plan.destination for plan in outcomes
+                 if plan.status == "renamed" and plan.destination is not None}
+        if not moved:
+            return
+        self._forget_rows(moved)
+        records: dict[str, dict[str, Any]] = {}
+        for path, record in self.records.items():
+            destination = moved.get(path)
+            if destination is not None:
+                self._search_keys.pop(path, None)
+                path = str(destination)
+                record = {**record, "path": path, "name": destination.name}
+                self._mark_path_dirty(path)
+            records[path] = record
+        self.records = records
+        self._refresh_table(full=True)
 
     # ---------- Lifecycle ----------
     def _on_close(self) -> None:
@@ -1438,10 +2030,17 @@ def enable_windows_dpi_awareness() -> None:
 
 
 def main() -> None:
+    configure_logging()
     enable_windows_dpi_awareness()
     root = tk.Tk()
     PDFInventoryApp(root)
     root.mainloop()
+    # A cancelled scan or a stuck PDF parse can leave worker threads running, which would keep
+    # the process alive after the window closes. Settings and reports are already saved here.
+    if any(thread.is_alive() and not thread.daemon
+           for thread in threading.enumerate() if thread is not threading.main_thread()):
+        logging.shutdown()
+        os._exit(0)
 
 
 if __name__ == "__main__":

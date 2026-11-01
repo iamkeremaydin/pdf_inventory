@@ -2,7 +2,7 @@
 
 - **Analysed:** 2026-11-01, at commit `e2c1662`. Line numbers below refer to that commit.
 - **Environment:** Windows 11, Python 3.13.14, pypdf 6.21.4.
-- **Status:** H1, H2 and L9 (O1, O3) were fixed in Iteration 3; see `QUALITY_CYCLE.md`. Everything else below is still open.
+- **Status:** All findings are fixed. H1, H2 and L9 were fixed in Iteration 3; M1–M6 and L1–L8 in Iteration 4. The filename cleaner was moved into the app in Iteration 5. See `QUALITY_CYCLE.md`. Line numbers below refer to the analysed commit, not the current code.
 
 ## 1. Summary
 
@@ -75,7 +75,7 @@ PDFInventoryApp (1,015 lines, 53 methods)
 - **Cause:** On Windows, `DirEntry.is_dir(follow_symlinks=False)` returns True for junctions, which are not symlinks.
 - **Effect:** A junction that loops back to its parent made a tree containing one PDF report 64 PDFs across 129 folders, until the path length ran out at 856 characters. All 64 copies would go to hashing and be flagged as duplicates. A junction pointing at a sibling folder (no loop) also double-lists every file in it.
 - **Fix:** Skip reparse points, or remember visited `(st_dev, st_ino)` pairs, which also catches hard links (L9). Use `DirEntry.is_junction()` on Python 3.12+, and `st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT` from `entry.stat(follow_symlinks=False)` on 3.10–3.11.
-- **Also affects the cleaner:** `scan_pdf_files` in `pdf_filename_cleaner.py` has the same pattern. Its collision checks prevent damage, but a looped file is planned many times.
+- **Also affected the cleaner:** the former standalone cleaner's folder scan had the same pattern. It was fixed in Iteration 3, and the cleaner is now part of the app.
 
 **H2. The skip-list silently drops user folders with common names, at any depth.** *Measured. Fixed in Iteration 3.*
 - **Where:** `SKIP_DIR_NAMES`, `pdf_inventory.py:170` and `:732`.
@@ -87,12 +87,12 @@ PDFInventoryApp (1,015 lines, 53 methods)
 
 ### Medium
 
-**M1. Idle CPU use whenever a sort or search is active.** *Measured.*
+**M1. Idle CPU use whenever a sort or search is active.** *Measured.* *Fixed in Iteration 4.*
 - **Where:** `_poll_worker_queue` (`:1011`) calls `_update_count_label` (`:1228`) on every 100 ms tick, and that re-runs `_filtered_records()` whenever the table isn't in plain mode.
 - **Effect:** With 10,000 rows, each tick costs 54 ms when sorted by name and 80 ms with a search active. That keeps one core 35–45 % busy indefinitely while nothing is happening.
 - **Fix:** Store the visible count when the table is refreshed, and only recompute it when the records, query, sort or filter change.
 
-**M2. Search and sorting do a full rebuild with repeated work.** *Measured.*
+**M2. Search and sorting do a full rebuild with repeated work.** *Measured.* *Fixed in Iteration 4.*
 - **Effect:**
   - One search keystroke costs 584 ms at 10,000 rows.
   - `_apply_search` filters three times: once in `_refresh_table` and twice through `_update_count_label`.
@@ -100,12 +100,12 @@ PDFInventoryApp (1,015 lines, 53 methods)
   - While a scan runs with a sort active, every tick that brings new rows rebuilds the whole tree.
 - **Fix:** Cache a normalised search key per record when the record arrives, and filter once per refresh. While scanning with a sort active, throttle rebuilds (for example to at most one every 500 ms) or insert rows in sorted position.
 
-**M3. The reason a file is "Corrupted" or "Unreadable" is collected and then thrown away.** *Reasoned, confirmed in data.*
+**M3. The reason a file is "Corrupted" or "Unreadable" is collected and then thrown away.** *Reasoned, confirmed in data.* *Fixed in Iteration 4.*
 - **Where:** `record["error"]` is set in `inspect_pdf` (`:315`, `:317`) but never displayed or exported.
 - **Your library:** the real inventory has 4 files marked "Bozuk" (Corrupted), one of them 64 MB. There's no way to tell actual damage from a pypdf parsing limitation.
 - **Fix:** Show the error as a tooltip or in a details pane, and add an optional "Problem" column to the export.
 
-**M4. Duplicates aren't grouped, so you can't see which file matches which.** *Reasoned, confirmed in data.*
+**M4. Duplicates aren't grouped, so you can't see which file matches which.** *Reasoned, confirmed in data.* *Fixed in Iteration 4.*
 - **Your library:** the real export flags 7 files as duplicates. They form 3 groups: 2 copies of Kahneman, 3 of Allen Carr and 2 of Frankl. Nothing in the table or the CSV says which file belongs with which.
 - **Why the CSV can't help:** it contains only rounded sizes like "431.8 KB", so the groups can't be reliably rebuilt from it.
 - **Fix:**
@@ -113,14 +113,14 @@ PDFInventoryApp (1,015 lines, 53 methods)
   - Add a "reclaimable space" total to the status line.
   - Add exact byte sizes to the export.
 
-**M5. Parsing a PDF has no time limit.** *Reasoned, not reproduced.*
+**M5. Parsing a PDF has no time limit.** *Reasoned, not reproduced.* *Fixed in Iteration 4.*
 - **Where:** `inspect_pdf` runs pypdf on worker threads, which cannot be interrupted.
 - **Effect:**
   - One pathological PDF can occupy a worker indefinitely, and cancelling waits for it.
   - On close, `concurrent.futures` waits for its worker threads at exit. The window can disappear while `python.exe` keeps running until the queued inspections finish.
 - **Fix:** Wait for a real example before building a process pool with timeouts (backlog O11). As a cheap first step, record per-file inspection time so slow files can be spotted.
 
-**M6. The scan pipeline isn't tested, and CI never exercises page counting.** *Measured from the repo.*
+**M6. The scan pipeline isn't tested, and CI never exercises page counting.** *Measured from the repo.* *Fixed in Iteration 4.*
 - **Gaps:**
   - The 7 inventory tests cover helpers only.
   - `_scan_worker` is the longest function at 198 lines, and it lives inside the Tk class, so it can't be tested without a UI.
@@ -133,26 +133,26 @@ PDFInventoryApp (1,015 lines, 53 methods)
 
 ### Low
 
-- **L1. Two keyboard shortcut bugs.** *Measured.*
+- **L1. Two keyboard shortcut bugs.** *Fixed in Iteration 4.* *Measured.*
   - **Ctrl+Shift+C never fires.** Tk reports Shift+C as the keysym `C`, but the binding is `<Control-Shift-c>` (`:602`).
   - **Caps Lock disables every letter shortcut** (Ctrl+F/O/R/E/A).
   - **Fix:** bind the uppercase variants as well.
-- **L2. Zebra striping breaks when rows update during a scan.** *Measured.* In incremental mode, updated rows get their stripe from `len(self._iid_by_path)` (`:1141`) instead of their position. After an update, rows 0–4 showed `even, even, even, even, even`.
-- **L3. Dead or no-op code.**
+- **L2. Zebra striping breaks when rows update during a scan.** *Fixed in Iteration 4.* *Measured.* In incremental mode, updated rows get their stripe from `len(self._iid_by_path)` (`:1141`) instead of their position. After an update, rows 0–4 showed `even, even, even, even, even`.
+- **L3. Dead or no-op code.** *Fixed in Iteration 4.*
   - The `worker_error` event is handled (`:1004`) but never emitted.
   - The `msg_folder_error` text is never used: opening a folder shows the file error message.
   - `_append_library_warning` and `_queue_table_refresh` are one-line wrappers.
   - `lang_combo.configure(state="readonly")` in `_start_scan` (`:703`) changes nothing.
-- **L4. Maintainability.**
+- **L4. Maintainability.** *Fixed in Iteration 4.*
   - `_scan_worker` contains three copies of the same bounded-executor loop, about 45 lines each.
   - One class mixes scan orchestration, rendering, settings and export.
   - A single `bounded_map(executor, fn, items, cancel_event, on_result)` helper would remove about 90 lines and make each stage testable.
-- **L5. The window can open off-screen.** The saved geometry is restored without checking it against the current screen size, so it can land off-screen after a monitor change.
-- **L6. Export quirks.**
+- **L5. The window can open off-screen.** *Fixed in Iteration 4.* The saved geometry is restored without checking it against the current screen size, so it can land off-screen after a monitor change.
+- **L6. Export quirks.** *Fixed in Iteration 4.*
   - Exporting is allowed mid-scan and writes "Checking…" placeholders.
   - Size and date are exported as display text, so they don't sort as numbers in a spreadsheet.
-- **L7. The README overstates the features.** It says "page counts and metadata", but only page count, size and modified date are read.
-- **L8. Errors leave no trace when there's no console.** Errors are logged only to stderr. When the app is started with `pythonw` or by double-clicking, a scanner failure leaves nothing behind except the status line.
+- **L7. The README overstates the features.** *Fixed in Iteration 4.* It says "page counts and metadata", but only page count, size and modified date are read.
+- **L8. Errors leave no trace when there's no console.** *Fixed in Iteration 4.* Errors are logged only to stderr. When the app is started with `pythonw` or by double-clicking, a scanner failure leaves nothing behind except the status line.
 - **L9. The same file reached by two paths counts as a duplicate.** This happens with hard links and with the junction case in H1. The `(st_dev, st_ino)` check from H1 fixes both. *Fixed in Iteration 3: junctions are no longer followed, and hard links share one duplicate check.*
 
 ### Security
@@ -161,7 +161,7 @@ No significant findings. There's no network access and no execution of file cont
 
 ## 5. Scored opportunities
 
-This uses the same method as `PDF_CLEANER_QUALITY.md`:
+This method is also used for the backlog in `QUALITY_CYCLE.md`:
 - **Value, Fit and Confidence** are scored 1–3, higher is better.
 - **Effort and Risk** are scored 1–3, higher is worse.
 - **Score = V × F × C ÷ (E × R).**
@@ -170,16 +170,16 @@ This uses the same method as `PDF_CLEANER_QUALITY.md`:
 | ID | Opportunity | Fixes | V | F | C | E | R | Score | Success metric | Decision |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | O1 | Don't follow junctions; deduplicate by `(st_dev, st_ino)` | H1, L9 | 3 | 3 | 3 | 1 | 1 | 27 | A junction loop yields each file once; zero self-duplicates | Done in Iteration 3 |
-| O2 | Show the corruption or unreadable reason | M3 | 2 | 3 | 3 | 1 | 1 | 18 | Every non-OK row shows its reason in the UI and the export | Iteration 5 |
+| O2 | Show the corruption or unreadable reason | M3 | 2 | 3 | 3 | 1 | 1 | 18 | Every non-OK row shows its reason in the UI and the export | Done in Iteration 4 (Problem column) |
 | O3 | Limit the skip-list to real system locations; list skipped folders | H2 | 3 | 3 | 3 | 1 | 2 | 13.5 | `books/Windows/*.pdf` found; skipped folders visible by name | Done in Iteration 3 |
-| O4 | Cache the visible count and normalised search keys; filter once per refresh | M1, M2 | 2 | 3 | 3 | 2 | 1 | 9 | Idle tick < 2 ms and keystroke < 150 ms at 10,000 rows | Following iteration |
-| O5 | Duplicate groups and reclaimable space | M4 | 3 | 3 | 2 | 2 | 1 | 9 | Each duplicate shows its group; status shows space to reclaim | After O7 |
-| O6 | Shortcut fixes and row-position striping | L1, L2 | 1 | 3 | 3 | 1 | 1 | 9 | All shortcuts work with Shift and Caps Lock; stripes stay alternating | Bundle with O4 |
-| O7 | Extract a Tk-free scan pipeline with a `bounded_map` helper, plus tests | M6, L4 | 2 | 3 | 3 | 3 | 2 | 3 | Discovery and duplicate logic covered by tests; `_scan_worker` < 60 lines | Enabler: schedule before O5 |
-| O8 | Exact byte size column in the export | L6 | 2 | 2 | 2 | 1 | 2 | 4 | Size sorts numerically in a spreadsheet | Bundle with O5 (changes the CSV format) |
-| O9 | Read PDF title and author metadata | L7 | 2 | 2 | 1 | 2 | 2 | 2 | Users search by title or author | Hypothesis: validate demand; until then, fix the README wording |
+| O4 | Cache the visible count and normalised search keys; filter once per refresh | M1, M2 | 2 | 3 | 3 | 2 | 1 | 9 | Idle tick < 2 ms and keystroke < 150 ms at 10,000 rows | Done in Iteration 4 (measured 0 ms idle, 26 ms keystroke) |
+| O5 | Duplicate groups and reclaimable space | M4 | 3 | 3 | 2 | 2 | 1 | 9 | Each duplicate shows its group; status shows space to reclaim | Done in Iteration 4 |
+| O6 | Shortcut fixes and row-position striping | L1, L2 | 1 | 3 | 3 | 1 | 1 | 9 | All shortcuts work with Shift and Caps Lock; stripes stay alternating | Done in Iteration 4 |
+| O7 | Extract a Tk-free scan pipeline with a `bounded_map` helper, plus tests | M6, L4 | 2 | 3 | 3 | 3 | 2 | 3 | Discovery and duplicate logic covered by tests; `_scan_worker` < 60 lines | Done in Iteration 4 (`discover_pdfs`, `scan_folder`, `bounded_map`) |
+| O8 | Exact byte size column in the export | L6 | 2 | 2 | 2 | 1 | 2 | 4 | Size sorts numerically in a spreadsheet | Done in Iteration 4 |
+| O9 | Read PDF title and author metadata | L7 | 2 | 2 | 1 | 2 | 2 | 2 | Users search by title or author | README fixed in Iteration 4; metadata itself remains a hypothesis |
 | O10 | Cache results between scans; skip unchanged files | — | 2 | 2 | 1 | 3 | 2 | 0.67 | A rescan of 10,000 unchanged files takes < 10 % of the first scan | Hypothesis: profile a 10,000-file library first |
-| O11 | Inspection timeout through a process pool | M5 | 2 | 2 | 1 | 3 | 2 | 0.67 | A hanging PDF is reported within 30 s and the scan continues | Hypothesis: wait for a real hanging file |
+| O11 | Inspection timeout through a process pool | M5 | 2 | 2 | 1 | 3 | 2 | 0.67 | A hanging PDF is reported within 30 s and the scan continues | Partly done: 120 s watchdog in Iteration 4; a process pool remains a hypothesis |
 | O12 | Delete or move duplicates from the app | — | 2 | 1 | 1 | 3 | 3 | 0.22 | — | Rejected for now: destructive, outside the app's read-only promise |
 
 O7 scores low on its own, but it is what makes O5 and later work safe to change. That's why it is scheduled as an enabler rather than ranked with the features.
@@ -187,6 +187,8 @@ O7 scores low on its own, but it is what makes O5 and later work safe to change.
 ## 6. Proposed iterations (one theme each)
 
 These continue the numbering in `QUALITY_CYCLE.md`, where iterations 1–2 are already recorded.
+
+**Outcome:** the work ran as Iteration 3 (correct scan results), Iteration 4 (every remaining finding) and Iteration 5 (the filename cleaner inside the app). The plan below is kept as it was written.
 
 1. **Iteration 3: correct scan results (O1, O3).**
    - Both changes are in `_discover_pdfs`.
@@ -214,4 +216,6 @@ All probes ran against a temporary folder or a hidden app instance. None of them
 | L2 | Updated rows 0–4 in incremental mode | Stripes `even,odd,even,odd,even` became `even,even,even,even,even` |
 | M3, M4 | Read `pdf_envanteri_20261101_151258.csv` | 4 rows "Bozuk" with no reason; 7 duplicates in 3 unlabelled groups |
 
-Baseline: 17 unit tests pass (7 inventory, 10 cleaner).
+Baseline at analysis time: 17 unit tests passed (7 inventory, 10 cleaner). After Iterations 4 and 5: 44 tests, all in `test_pdf_inventory.py`.
+
+Since Iteration 4, discovery and the scan pipeline are module functions (`discover_pdfs`, `scan_folder`), so the H1 and H2 probes call those instead of `PDFInventoryApp._discover_pdfs`. The timing probe uses the same hidden-app method on `_poll_worker_queue` and `_apply_search`.
