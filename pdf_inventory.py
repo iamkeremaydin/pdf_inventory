@@ -16,7 +16,7 @@ import tempfile
 import threading
 import unicodedata
 from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -177,6 +177,9 @@ SKIP_DIR_NAMES = {
 }
 PARTIAL_HASH_BLOCK = 64 * 1024
 FULL_HASH_CHUNK = 1024 * 1024
+# Keep reader and hashing concurrency predictable on machines with many cores.
+MAX_SCAN_WORKERS = 4
+MAX_IN_FLIGHT_PER_WORKER = 2
 
 
 def normalize_search(value: str) -> str:
@@ -738,8 +741,8 @@ class PDFInventoryApp:
                 self._queue.put(("done", summary))
                 return
 
-            max_workers = min(8, max(2, os.cpu_count() or 2))
-            max_in_flight = max_workers * 2
+            max_workers = MAX_SCAN_WORKERS
+            max_in_flight = max_workers * MAX_IN_FLIGHT_PER_WORKER
             inspected: dict[str, dict[str, Any]] = {}
             size_groups: dict[int, list[Path]] = defaultdict(list)
             completed = 0
@@ -806,23 +809,36 @@ class PDFInventoryApp:
                 self._queue.put(("hash_stage", ("quick", len(candidates))))
                 quick_done = 0
                 with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="PDFQuickHash") as executor:
-                    futures = {
-                        executor.submit(_quick_hash, Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"]): rec
-                        for rec in candidates
-                    }
-                    for future in as_completed(futures):
+                    records = iter(candidates)
+                    futures: dict[Any, dict[str, Any]] = {}
+                    for _ in range(min(max_in_flight, len(candidates))):
+                        rec = next(records)
+                        futures[executor.submit(_quick_hash, Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"])] = rec
+                    while futures:
                         if self._cancel_event.is_set():
                             for pending in futures:
                                 pending.cancel()
                             break
-                        rec = futures[future]
-                        try:
-                            value = future.result()
-                        except OSError:
-                            value = None
-                        quick_results[rec["path"]] = value
-                        quick_done += 1
-                        self._queue.put(("hash_progress", ("quick", quick_done, len(candidates))))
+                        finished, _ = wait(futures, return_when=FIRST_COMPLETED)
+                        for future in finished:
+                            rec = futures.pop(future)
+                            if self._cancel_event.is_set():
+                                for pending in futures:
+                                    pending.cancel()
+                                break
+                            try:
+                                value = future.result()
+                            except OSError:
+                                value = None
+                            quick_results[rec["path"]] = value
+                            quick_done += 1
+                            self._queue.put(("hash_progress", ("quick", quick_done, len(candidates))))
+                        while not self._cancel_event.is_set() and len(futures) < max_in_flight:
+                            try:
+                                rec = next(records)
+                            except StopIteration:
+                                break
+                            futures[executor.submit(_quick_hash, Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"])] = rec
                 if self._cancel_event.is_set():
                     summary["cancelled"] = True
                     self._queue.put(("done", summary))
@@ -846,23 +862,36 @@ class PDFInventoryApp:
                 full_results: dict[str, str | None] = {}
                 full_done = 0
                 with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="PDFFullHash") as executor:
-                    futures = {
-                        executor.submit(_full_hash, Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"], self._cancel_event): rec
-                        for rec in full_candidates
-                    }
-                    for future in as_completed(futures):
+                    records = iter(full_candidates)
+                    futures: dict[Any, dict[str, Any]] = {}
+                    for _ in range(min(max_in_flight, len(full_candidates))):
+                        rec = next(records)
+                        futures[executor.submit(_full_hash, Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"], self._cancel_event)] = rec
+                    while futures:
                         if self._cancel_event.is_set():
                             for pending in futures:
                                 pending.cancel()
                             break
-                        rec = futures[future]
-                        try:
-                            value = future.result()
-                        except OSError:
-                            value = None
-                        full_results[rec["path"]] = value
-                        full_done += 1
-                        self._queue.put(("hash_progress", ("full", full_done, len(full_candidates))))
+                        finished, _ = wait(futures, return_when=FIRST_COMPLETED)
+                        for future in finished:
+                            rec = futures.pop(future)
+                            if self._cancel_event.is_set():
+                                for pending in futures:
+                                    pending.cancel()
+                                break
+                            try:
+                                value = future.result()
+                            except OSError:
+                                value = None
+                            full_results[rec["path"]] = value
+                            full_done += 1
+                            self._queue.put(("hash_progress", ("full", full_done, len(full_candidates))))
+                        while not self._cancel_event.is_set() and len(futures) < max_in_flight:
+                            try:
+                                rec = next(records)
+                            except StopIteration:
+                                break
+                            futures[executor.submit(_full_hash, Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"], self._cancel_event)] = rec
                 if self._cancel_event.is_set():
                     summary["cancelled"] = True
                     self._queue.put(("done", summary))
