@@ -23,6 +23,7 @@ from typing import Iterable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PYTHON_EXECUTABLE = re.compile(r"(py|pyw|python[\d.]*w?)\.exe", re.IGNORECASE)
+IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
 
 MARKER_SUFFIX = re.compile(
     r"\s*\((?P<marker>z-library|z-library\.sk\s*,\s*1lib\.sk\s*,\s*z-lib\.sk)\)\s*$",
@@ -53,8 +54,18 @@ def cleaned_pdf_name(name: str) -> tuple[str, str] | None:
     return cleaned_stem + path.suffix, match.group("marker")
 
 
+def is_link_or_junction(entry: os.DirEntry[str]) -> bool:
+    """True for symlinks and Windows junctions, which can loop back into the scanned tree."""
+    if entry.is_symlink():
+        return True
+    is_junction = getattr(entry, "is_junction", None)  # Python 3.12+
+    if is_junction is not None:
+        return bool(is_junction())
+    return getattr(entry.stat(follow_symlinks=False), "st_reparse_tag", 0) == IO_REPARSE_TAG_MOUNT_POINT
+
+
 def scan_pdf_files(root: Path) -> tuple[list[Path], list[str]]:
-    """Collect regular PDFs below root without following directory symlinks."""
+    """Collect regular PDFs below root without following directory symlinks or junctions."""
     files: list[Path] = []
     warnings: list[str] = []
     stack = [root]
@@ -65,7 +76,8 @@ def scan_pdf_files(root: Path) -> tuple[list[Path], list[str]]:
                 for entry in entries:
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            stack.append(Path(entry.path))
+                            if not is_link_or_junction(entry):
+                                stack.append(Path(entry.path))
                         elif entry.is_file(follow_symlinks=False) and entry.name.casefold().endswith(".pdf"):
                             files.append(Path(entry.path))
                     except OSError as exc:

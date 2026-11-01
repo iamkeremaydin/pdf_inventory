@@ -1,6 +1,7 @@
 import contextlib
 import csv
 import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,6 +42,22 @@ class PdfFilenameCleanerTest(unittest.TestCase):
 
             self.assertEqual(warnings, [])
             self.assertEqual([path.name for path in files], ["Book (Z-Library).pdf"])
+
+    @unittest.skipUnless(os.name == "nt", "junctions are a Windows feature")
+    def test_scan_does_not_follow_a_junction_back_into_the_tree(self):
+        import _winapi
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "Book (Z-Library).pdf").write_bytes(b"pdf bytes")
+            _winapi.CreateJunction(str(root), str(nested / "loop"))
+
+            files, warnings = scan_pdf_files(root)
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(files, [nested / "Book (Z-Library).pdf"])
 
     def test_collision_is_skipped_without_overwriting_the_existing_file(self):
         with tempfile.TemporaryDirectory() as directory:

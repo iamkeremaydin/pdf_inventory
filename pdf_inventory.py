@@ -100,6 +100,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "filename_prefix": "pdf_inventory",
         "choose_folder": "Select the folder to scan",
         "choose_export": "Export CSV",
+        "skipped_button": "Skipped folders ({count})",
+        "skipped_title": "Skipped folders",
+        "skipped_intro": "These folders were not scanned:",
+        "skipped_more": "…and {count} more.",
+        "skip_reason_system": "System folder",
+        "skip_reason_link": "Link or junction",
+        "skip_reason_access": "No access",
     },
     "tr": {
         "title": "PDF Master Suite — Envanter",
@@ -161,18 +168,31 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "filename_prefix": "pdf_envanteri",
         "choose_folder": "Taranacak klasörü seçin",
         "choose_export": "CSV dışa aktar",
+        "skipped_button": "Atlanan klasörler ({count})",
+        "skipped_title": "Atlanan klasörler",
+        "skipped_intro": "Bu klasörler taranmadı:",
+        "skipped_more": "…ve {count} klasör daha.",
+        "skip_reason_system": "Sistem klasörü",
+        "skip_reason_link": "Sembolik bağlantı veya bağlantı noktası",
+        "skip_reason_access": "Erişim yok",
     },
 }
 
 
 # Directories that are almost never useful in an inventory scan. The selected
 # root itself is still scanned even when its name matches one of these entries.
-SKIP_DIR_NAMES = {
-    "$recycle.bin", "system volume information", "windows", "program files",
-    "program files (x86)", "programdata", "perflogs", "$winreagent",
+# Volume bookkeeping folders are skipped wherever they appear.
+VOLUME_SKIP_DIR_NAMES = {
+    "$recycle.bin", "system volume information", "$winreagent",
     ".spotlight-v100", ".trashes", ".fseventsd", ".documentrevisions-v100",
     ".temporaryitems",
 }
+# Operating-system folders are skipped only directly below a drive root, so a
+# library folder such as Books/Windows is still scanned.
+SYSTEM_SKIP_DIR_NAMES = {
+    "windows", "program files", "program files (x86)", "programdata", "perflogs",
+}
+IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
 PARTIAL_HASH_BLOCK = 64 * 1024
 FULL_HASH_CHUNK = 1024 * 1024
 # Keep reader and hashing concurrency predictable on machines with many cores.
@@ -181,6 +201,26 @@ MAX_IN_FLIGHT_PER_WORKER = 2
 # Backpressure prevents a fast scanner from retaining an unbounded number of
 # pending UI updates while the main thread renders a large result set.
 MAX_UI_QUEUE_EVENTS = 512
+
+
+def skip_reason(path: Path) -> str | None:
+    """Return why a directory below the scan root is skipped, or None to scan it."""
+    name = path.name.casefold()
+    if name in VOLUME_SKIP_DIR_NAMES:
+        return "system"
+    if name in SYSTEM_SKIP_DIR_NAMES and path.parent.parent == path.parent:
+        return "system"
+    return None
+
+
+def is_link_or_junction(entry: os.DirEntry[str]) -> bool:
+    """True for symlinks and Windows junctions, which can loop back into the scanned tree."""
+    if entry.is_symlink():
+        return True
+    is_junction = getattr(entry, "is_junction", None)  # Python 3.12+
+    if is_junction is not None:
+        return bool(is_junction())
+    return getattr(entry.stat(follow_symlinks=False), "st_reparse_tag", 0) == IO_REPARSE_TAG_MOUNT_POINT
 
 
 def normalize_search(value: str) -> str:
@@ -286,11 +326,12 @@ def inspect_pdf(path: Path) -> dict[str, Any]:
         "path": str(path), "name": path.name, "folder": path.parent.name,
         "size_bytes": None, "mtime": None, "mtime_ns": None, "pages": None,
         "page_state": "unavailable" if not PYPDF_AVAILABLE else "pending",
-        "duplicate": False, "quick_hash": None, "error": None,
+        "duplicate": False, "quick_hash": None, "error": None, "file_id": None,
     }
     try:
         stat = path.stat()
-        record.update(size_bytes=stat.st_size, mtime=stat.st_mtime, mtime_ns=stat.st_mtime_ns)
+        record.update(size_bytes=stat.st_size, mtime=stat.st_mtime, mtime_ns=stat.st_mtime_ns,
+                      file_id=(stat.st_dev, stat.st_ino) if stat.st_ino else None)
     except OSError as exc:
         record.update(page_state="unreadable", error=str(exc))
         return record
@@ -349,6 +390,7 @@ class PDFInventoryApp:
         self._scan_progress = 0
         self._scan_total = 0
         self._skipped_dirs = 0
+        self._skipped_folders: list[tuple[str, str]] = []
         self._sort_column: str | None = None
         self._sort_reverse = False
         self.duplicates_only_var = tk.BooleanVar(value=False)
@@ -588,6 +630,8 @@ class PDFInventoryApp:
         self.lbl_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.progress = ttk.Progressbar(bottom, orient=tk.HORIZONTAL, length=self._px(280), mode="determinate")
         self.progress.pack(side=tk.RIGHT, padx=(self._px(12), 0))
+        # Packed only after a scan that skipped folders; see _finish_scan.
+        self.btn_skipped = ttk.Button(bottom, style="Neutral.TButton", command=self._show_skipped_folders)
 
         self._bind_shortcuts()
         self._update_count_label()
@@ -613,6 +657,7 @@ class PDFInventoryApp:
         self.btn_scan.config(text=self._t("cancel_scan" if self.is_scanning else "scan"))
         self.btn_clear.config(text=self._t("clear"))
         self.duplicates_only.config(text=self._t("duplicates_only"))
+        self.btn_skipped.config(text=self._t("skipped_button", count=len(self._skipped_folders)))
         self.lang_combo.set("Türkçe" if self.current_lang == "tr" else "English")
         sep_keys = ("auto", "comma", "semicolon", "tab")
         self._separator_labels = {self._t("sep_" + key): key for key in sep_keys}
@@ -694,6 +739,8 @@ class PDFInventoryApp:
         self._scan_progress = 0
         self._scan_total = 0
         self._skipped_dirs = 0
+        self._skipped_folders = []
+        self.btn_skipped.pack_forget()
         self.progress.stop()
         self.progress.configure(mode="indeterminate", maximum=100)
         self.progress.start(12)
@@ -715,9 +762,10 @@ class PDFInventoryApp:
 
     @staticmethod
     def _discover_pdfs(root_path: Path, cancel_event: threading.Event,
-                       emit_progress: Any) -> tuple[list[Path], int]:
+                       emit_progress: Any) -> tuple[list[Path], list[tuple[str, str]]]:
+        """Return discovered PDFs and (path, reason) pairs for skipped directories."""
         pdfs: list[Path] = []
-        skipped_dirs = 0
+        skipped: list[tuple[str, str]] = []
         visited_dirs = 0
         stack = [root_path]
         while stack and not cancel_event.is_set():
@@ -729,10 +777,12 @@ class PDFInventoryApp:
                             break
                         try:
                             if entry.is_dir(follow_symlinks=False):
-                                if entry.name.casefold() in SKIP_DIR_NAMES:
-                                    skipped_dirs += 1
+                                directory = Path(entry.path)
+                                reason = "link" if is_link_or_junction(entry) else skip_reason(directory)
+                                if reason:
+                                    skipped.append((entry.path, reason))
                                 else:
-                                    stack.append(Path(entry.path))
+                                    stack.append(directory)
                             elif entry.is_file(follow_symlinks=False):
                                 if entry.name.startswith("._"):
                                     continue
@@ -744,21 +794,22 @@ class PDFInventoryApp:
             except OSError:
                 if current == root_path:
                     raise
-                skipped_dirs += 1
+                skipped.append((str(current), "access"))
             visited_dirs += 1
             if visited_dirs % 20 == 0:
-                emit_progress(len(pdfs), visited_dirs, skipped_dirs)
-        emit_progress(len(pdfs), visited_dirs, skipped_dirs)
-        return pdfs, skipped_dirs
+                emit_progress(len(pdfs), visited_dirs, len(skipped))
+        emit_progress(len(pdfs), visited_dirs, len(skipped))
+        return pdfs, skipped
 
     def _scan_worker(self, root_path: Path) -> None:
-        summary: dict[str, Any] = {"cancelled": False, "skipped_dirs": 0}
+        summary: dict[str, Any] = {"cancelled": False, "skipped_dirs": 0, "skipped_folders": []}
         try:
-            pdf_paths, skipped_dirs = self._discover_pdfs(
+            pdf_paths, skipped_folders = self._discover_pdfs(
                 root_path, self._cancel_event,
                 lambda found, folders, skipped: self._queue.put(("discovering", (found, folders, skipped))),
             )
-            summary["skipped_dirs"] = skipped_dirs
+            summary["skipped_dirs"] = len(skipped_folders)
+            summary["skipped_folders"] = skipped_folders
             if self._cancel_event.is_set():
                 summary["cancelled"] = True
                 self._queue.put(("done", summary))
@@ -800,7 +851,7 @@ class PDFInventoryApp:
                                 "path": str(path), "name": path.name, "folder": path.parent.name,
                                 "size_bytes": None, "mtime": None, "mtime_ns": None, "pages": None,
                                 "page_state": "unreadable", "duplicate": False, "quick_hash": None,
-                                "error": str(exc),
+                                "error": str(exc), "file_id": None,
                             }
                         inspected[str(path)] = record
                         if record.get("size_bytes") is not None:
@@ -822,15 +873,28 @@ class PDFInventoryApp:
                 self._queue.put(("done", summary))
                 return
 
+            # Hard links share one file: hash only the first path and give the others its result.
+            hard_link_of: dict[str, str] = {}
             candidates: list[dict[str, Any]] = []
             for group in size_groups.values():
-                if len(group) > 1:
-                    for path in group:
-                        record = inspected.get(str(path))
-                        if record and record.get("size_bytes") is not None:
-                            record["duplicate"] = None
-                            candidates.append(record)
-                            self._queue.put(("file_update", dict(record)))
+                first_path_by_id: dict[Any, str] = {}
+                distinct: list[dict[str, Any]] = []
+                for path in group:
+                    record = inspected.get(str(path))
+                    if not record or record.get("size_bytes") is None:
+                        continue
+                    file_id = record.get("file_id")
+                    if file_id is not None and file_id in first_path_by_id:
+                        hard_link_of[record["path"]] = first_path_by_id[file_id]
+                        continue
+                    if file_id is not None:
+                        first_path_by_id[file_id] = record["path"]
+                    distinct.append(record)
+                if len(distinct) > 1:
+                    for record in distinct:
+                        record["duplicate"] = None
+                        candidates.append(record)
+                        self._queue.put(("file_update", dict(record)))
 
             # Stage 1: a small partial hash narrows same-size files to likely matches.
             quick_results: dict[str, str | None] = {}
@@ -937,6 +1001,8 @@ class PDFInventoryApp:
                         for path in same_content_paths:
                             duplicate_states[path] = True
 
+            for path, first_path in hard_link_of.items():
+                duplicate_states[path] = duplicate_states.get(first_path, False)
             for path, state in duplicate_states.items():
                 record = inspected.get(path)
                 if record:
@@ -1021,6 +1087,11 @@ class PDFInventoryApp:
         self.lang_combo.configure(state="readonly")
         self.btn_export.configure(state=tk.NORMAL if self.records else tk.DISABLED)
         self._skipped_dirs = int(summary.get("skipped_dirs", self._skipped_dirs))
+        self._skipped_folders = list(summary.get("skipped_folders", []))
+        if self._skipped_folders:
+            self.btn_skipped.config(text=self._t("skipped_button", count=len(self._skipped_folders)))
+            # Packed before the status label so a long status message cannot squeeze it out.
+            self.btn_skipped.pack(side=tk.RIGHT, padx=(self._px(12), 0), before=self.lbl_status)
         count = len(self.records)
         duplicates = sum(1 for rec in self.records.values() if rec.get("duplicate") is True)
         corrupt = sum(1 for rec in self.records.values() if rec.get("page_state") == "corrupt")
@@ -1035,6 +1106,14 @@ class PDFInventoryApp:
             self._set_status("status_done", count=count, duplicates=duplicates, corrupt=corrupt,
                              errors=errors, skipped=self._skipped_dirs)
         self._save_settings()
+
+    def _show_skipped_folders(self) -> None:
+        limit = 40
+        lines = [self._t("skipped_intro"), ""]
+        lines += [f"{self._t('skip_reason_' + reason)}: {path}" for path, reason in self._skipped_folders[:limit]]
+        if len(self._skipped_folders) > limit:
+            lines += ["", self._t("skipped_more", count=len(self._skipped_folders) - limit)]
+        messagebox.showinfo(self._t("skipped_title"), "\n".join(lines))
 
     # ---------- Table, filtering and sorting ----------
     def _mark_path_dirty(self, path: str) -> None:

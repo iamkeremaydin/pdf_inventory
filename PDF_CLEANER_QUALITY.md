@@ -66,6 +66,7 @@ The cleaner removes two confirmed source tags from the end of PDF filenames. It 
 | Medium | Failed output after renaming left an empty audit report | Fixed in Iteration 3 |
 | Medium | Very large trees are collected in memory before collision planning | Profile a 10,000-file library before changing the safe planning model |
 | Low | An interrupt during the rename loop records none of that run's completed renames | Backlog item B |
+| Low | Scanning followed folder junctions, so a looping junction planned the same file many times (collision checks prevented damage) | Fixed with the inventory app's Iteration 3 junction rule; covered by a test |
 | Low | No persistent telemetry or external error monitoring | Deliberately deferred for this local, privacy-preserving utility; audit reports retain operation outcomes |
 
 ## Scored backlog
