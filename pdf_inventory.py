@@ -119,6 +119,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "menu_tools": "Tools",
         "menu_select_folder": "Select folder…",
         "menu_exit": "Exit",
+        "menu_resources": "Resource usage",
+        "resources_detected": "This PC: {cpus} logical processors",
+        "resource_low": "Low — {workers} thread(s), background priority",
+        "resource_medium": "Medium — {workers} threads (default)",
+        "resource_high": "High — {workers} threads, fastest",
+        "status_resources": "Resource usage set to {level}: {workers} scan threads.",
+        "level_low": "Low",
+        "level_medium": "Medium",
+        "level_high": "High",
         "tool_clean": "Clean PDF filenames…",
         "tool_undo": "Undo a filename cleanup…",
         "clean_title": "Clean PDF filenames",
@@ -226,6 +235,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "menu_tools": "Araçlar",
         "menu_select_folder": "Klasör seç…",
         "menu_exit": "Çıkış",
+        "menu_resources": "Kaynak kullanımı",
+        "resources_detected": "Bu bilgisayar: {cpus} mantıksal işlemci",
+        "resource_low": "Düşük — {workers} iş parçacığı, arka plan önceliği",
+        "resource_medium": "Orta — {workers} iş parçacığı (varsayılan)",
+        "resource_high": "Yüksek — {workers} iş parçacığı, en hızlı",
+        "status_resources": "Kaynak kullanımı: {level}, {workers} tarama iş parçacığı.",
+        "level_low": "Düşük",
+        "level_medium": "Orta",
+        "level_high": "Yüksek",
         "tool_clean": "PDF dosya adlarını temizle…",
         "tool_undo": "Dosya adı temizliğini geri al…",
         "clean_title": "PDF dosya adlarını temizle",
@@ -276,9 +294,13 @@ SYSTEM_SKIP_DIR_NAMES = {
 IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
 PARTIAL_HASH_BLOCK = 64 * 1024
 FULL_HASH_CHUNK = 1024 * 1024
-# Keep reader and hashing concurrency predictable on machines with many cores.
-MAX_SCAN_WORKERS = 4
+# Each worker may have one more task queued so it never waits for the scanner to hand out work.
 MAX_IN_FLIGHT_PER_WORKER = 2
+# Resource usage levels, from lightest to heaviest. Every launch starts at the default.
+RESOURCE_LEVELS = ("low", "medium", "high")
+DEFAULT_RESOURCE_LEVEL = "medium"
+BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+NORMAL_PRIORITY_CLASS = 0x20
 # Backpressure prevents a fast scanner from retaining an unbounded number of
 # pending UI updates while the main thread renders a large result set.
 MAX_UI_QUEUE_EVENTS = 512
@@ -286,6 +308,72 @@ MAX_UI_QUEUE_EVENTS = 512
 INSPECT_TIMEOUT_SECONDS = 120
 # Sorted or filtered tables rebuild at most this often while a scan streams in new rows.
 SCAN_TABLE_REFRESH_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class ResourceProfile:
+    level: str
+    workers: int
+    hash_chunk: int
+    background_priority: bool
+
+
+def available_cpus() -> int:
+    """Logical processors this process may use (respects CPU affinity on Python 3.13+)."""
+    counter = getattr(os, "process_cpu_count", None) or os.cpu_count
+    return max(1, counter() or 1)
+
+
+def resource_profile(level: str, cpus: int | None = None) -> ResourceProfile:
+    """Size scan concurrency and read buffers for a level on a machine with cpus processors."""
+    cpus = cpus or available_cpus()
+    if level == "low":
+        # One or two threads with small reads and below-normal priority keep the PC responsive.
+        return ResourceProfile("low", max(1, min(cpus // 4, 2)), 256 * 1024, True)
+    if level == "high":
+        # PDF reads also wait on disk or network, so a few extra threads still help on small CPUs.
+        return ResourceProfile("high", max(4, min(cpus, 16)), 4 * 1024 * 1024, False)
+    return ResourceProfile("medium", max(2, min(cpus // 2, 6)), FULL_HASH_CHUNK, False)
+
+
+def apply_process_priority(background: bool) -> None:
+    """Lower or restore this process's CPU priority. Windows only; elsewhere it is left alone,
+    because an unprivileged process cannot raise its priority again after lowering it."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        # A private handle with declared types: the default int return truncates 64-bit handles.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetPriorityClass.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.SetPriorityClass.restype = wintypes.BOOL
+        priority = BELOW_NORMAL_PRIORITY_CLASS if background else NORMAL_PRIORITY_CLASS
+        if not kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), priority):
+            logging.warning("Could not change process priority (error %s)", ctypes.get_last_error())  # type: ignore[attr-defined]
+    except Exception:
+        logging.exception("Could not change process priority")
+
+
+class ResourceGovernor:
+    """The active resource level. The scanner reads it while it runs, so a change applies mid-scan."""
+
+    def __init__(self, level: str = DEFAULT_RESOURCE_LEVEL, cpus: int | None = None):
+        self.cpus = cpus or available_cpus()
+        self.profile = resource_profile(level if level in RESOURCE_LEVELS else DEFAULT_RESOURCE_LEVEL, self.cpus)
+
+    @property
+    def level(self) -> str:
+        return self.profile.level
+
+    def set_level(self, level: str) -> None:
+        if level not in RESOURCE_LEVELS:
+            raise ValueError(f"Unknown resource level: {level}")
+        previous, self.profile = self.profile, resource_profile(level, self.cpus)
+        if previous.background_priority != self.profile.background_priority:
+            apply_process_priority(self.profile.background_priority)
 
 
 def skip_reason(path: Path) -> str | None:
@@ -384,7 +472,7 @@ def _quick_hash(path: Path, expected_size: int, expected_mtime_ns: int | None = 
 
 
 def _full_hash(path: Path, expected_size: int, expected_mtime_ns: int | None = None,
-               cancel_event: threading.Event | None = None) -> str | None:
+               cancel_event: threading.Event | None = None, chunk_size: int = FULL_HASH_CHUNK) -> str | None:
     """Compute SHA-256 in bounded chunks and reject files changed mid-scan."""
     if cancel_event is not None and cancel_event.is_set():
         return None
@@ -393,7 +481,7 @@ def _full_hash(path: Path, expected_size: int, expected_mtime_ns: int | None = N
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 return None
-            chunk = stream.read(FULL_HASH_CHUNK)
+            chunk = stream.read(chunk_size)
             if not chunk:
                 break
             digest.update(chunk)
@@ -505,17 +593,22 @@ def discover_pdfs(root_path: Path, cancel_event: threading.Event,
 
 def bounded_map(fn: Callable[[Any], Any], items: Iterable[Any], cancel_event: threading.Event,
                 on_result: Callable[[Any, Any, BaseException | None], None], *,
-                timeout: float | None = None, name: str = "PDFWorker") -> bool:
-    """Run fn over items on MAX_SCAN_WORKERS threads, keeping at most MAX_IN_FLIGHT tasks queued.
+                timeout: float | None = None, name: str = "PDFWorker",
+                governor: ResourceGovernor | None = None) -> bool:
+    """Run fn over items on the governor's worker threads, keeping at most
+    MAX_IN_FLIGHT_PER_WORKER tasks per worker submitted.
 
     on_result(item, result, error) runs on the calling thread. A task that runs longer than
     timeout seconds is reported with a TimeoutError and abandoned: its thread finishes in the
-    background while queued work moves to a fresh pool. Returns False when cancelled; cancelling
-    does not wait for running tasks.
+    background while queued work moves to a fresh pool. When the governor's worker count changes,
+    queued work also moves to a fresh pool of the new size; running tasks finish where they are
+    and still count toward the limit. Returns False when cancelled; cancelling does not wait for
+    running tasks.
     """
-    max_in_flight = MAX_SCAN_WORKERS * MAX_IN_FLIGHT_PER_WORKER
+    governor = governor or ResourceGovernor()
     source = iter(items)
-    executor = ThreadPoolExecutor(max_workers=MAX_SCAN_WORKERS, thread_name_prefix=name)
+    workers = governor.profile.workers
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=name)
     pending: dict[Future[Any], tuple[Any, list[float | None]]] = {}
 
     def submit(item: Any) -> None:
@@ -527,8 +620,19 @@ def bounded_map(fn: Callable[[Any], Any], items: Iterable[Any], cancel_event: th
 
         pending[executor.submit(run)] = (item, started)
 
+    def restart_pool() -> None:
+        nonlocal executor, workers
+        requeue = [pending.pop(future)[0] for future in list(pending) if future.cancel()]
+        executor.shutdown(wait=False)
+        workers = governor.profile.workers
+        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=name)
+        for item in requeue:
+            submit(item)
+
     def fill() -> None:
-        while len(pending) < max_in_flight and not cancel_event.is_set():
+        if governor.profile.workers != workers:
+            restart_pool()
+        while len(pending) < workers * MAX_IN_FLIGHT_PER_WORKER and not cancel_event.is_set():
             try:
                 item = next(source)
             except StopIteration:
@@ -557,22 +661,21 @@ def bounded_map(fn: Callable[[Any], Any], items: Iterable[Any], cancel_event: th
                     for future in stuck:
                         item, _started = pending.pop(future)
                         on_result(item, None, TimeoutError(f"Timed out after {timeout:g} s"))
-                    requeue = [pending.pop(future)[0] for future in list(pending) if future.cancel()]
-                    executor.shutdown(wait=False)
-                    executor = ThreadPoolExecutor(max_workers=MAX_SCAN_WORKERS, thread_name_prefix=name)
-                    for item in requeue:
-                        submit(item)
+                    restart_pool()
             fill()
         return not cancel_event.is_set()
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def scan_folder(root_path: Path, cancel_event: threading.Event, emit: Callable[[str, Any], None]) -> None:
+def scan_folder(root_path: Path, cancel_event: threading.Event, emit: Callable[[str, Any], None],
+                governor: ResourceGovernor | None = None) -> None:
     """Discover, inspect and compare the PDFs below root_path, reporting through emit(kind, payload).
 
     Runs on a worker thread and never touches Tk. The last event is always ("done", summary).
+    governor sets the thread count and read size, and may change while the scan runs.
     """
+    governor = governor or ResourceGovernor()
     summary: dict[str, Any] = {"cancelled": False, "skipped_dirs": 0, "skipped_folders": []}
 
     def finish(cancelled: bool) -> None:
@@ -606,7 +709,7 @@ def scan_folder(root_path: Path, cancel_event: threading.Event, emit: Callable[[
             emit("inspect_progress", (len(inspected), total))
 
         if not bounded_map(inspect_pdf, pdf_paths, cancel_event, on_inspected,
-                           timeout=INSPECT_TIMEOUT_SECONDS, name="PDFInspect"):
+                           timeout=INSPECT_TIMEOUT_SECONDS, name="PDFInspect", governor=governor):
             return finish(True)
 
         # Hard links share one file: hash only the first path and give the others its result.
@@ -641,7 +744,7 @@ def scan_folder(root_path: Path, cancel_event: threading.Event, emit: Callable[[
                 emit("hash_progress", ("quick", len(quick_results), len(candidates)))
 
             if not bounded_map(lambda rec: _quick_hash(Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"]),
-                               candidates, cancel_event, on_quick, name="PDFQuickHash"):
+                               candidates, cancel_event, on_quick, name="PDFQuickHash", governor=governor):
                 return finish(True)
 
         likely_groups: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
@@ -665,8 +768,9 @@ def scan_folder(root_path: Path, cancel_event: threading.Event, emit: Callable[[
                 emit("hash_progress", ("full", len(full_results), len(full_candidates)))
 
             if not bounded_map(
-                lambda rec: _full_hash(Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"], cancel_event),
-                full_candidates, cancel_event, on_full, name="PDFFullHash",
+                lambda rec: _full_hash(Path(rec["path"]), rec["size_bytes"], rec["mtime_ns"], cancel_event,
+                                       governor.profile.hash_chunk),
+                full_candidates, cancel_event, on_full, name="PDFFullHash", governor=governor,
             ):
                 return finish(True)
 
@@ -999,6 +1103,9 @@ class PDFInventoryApp:
         self._sort_reverse = False
         self.duplicates_only_var = tk.BooleanVar(value=False)
         self._ui_scale = 1.0
+        # Not saved: every launch starts at the default level, whatever the last session used.
+        self.resource_governor = ResourceGovernor()
+        self.resource_level_var = tk.StringVar(value=self.resource_governor.level)
 
         self._setup_window()
         self._setup_styles()
@@ -1149,6 +1256,14 @@ class PDFInventoryApp:
         self.tools_menu = tk.Menu(self.menubar, tearoff=False)
         self.tools_menu.add_command(command=self._open_filename_cleaner)
         self.tools_menu.add_command(command=self._open_cleanup_undo)
+        self.tools_menu.add_separator()
+        self.resources_menu = tk.Menu(self.tools_menu, tearoff=False)
+        self.resources_menu.add_command(state=tk.DISABLED)
+        self.resources_menu.add_separator()
+        for level in RESOURCE_LEVELS:
+            self.resources_menu.add_radiobutton(variable=self.resource_level_var, value=level,
+                                                command=self._on_resource_level_change)
+        self.tools_menu.add_cascade(menu=self.resources_menu)
         self.menubar.add_cascade(menu=self.file_menu)
         self.menubar.add_cascade(menu=self.tools_menu)
         self.root.configure(menu=self.menubar)
@@ -1288,6 +1403,11 @@ class PDFInventoryApp:
         self.file_menu.entryconfigure(4, label=self._t("menu_exit"))
         self.tools_menu.entryconfigure(0, label=self._t("tool_clean"))
         self.tools_menu.entryconfigure(1, label=self._t("tool_undo"))
+        self.tools_menu.entryconfigure(3, label=self._t("menu_resources"))
+        self.resources_menu.entryconfigure(0, label=self._t("resources_detected", cpus=self.resource_governor.cpus))
+        for index, level in enumerate(RESOURCE_LEVELS, start=2):
+            workers = resource_profile(level, self.resource_governor.cpus).workers
+            self.resources_menu.entryconfigure(index, label=self._t("resource_" + level, workers=workers))
         self.lang_combo.set("Türkçe" if self.current_lang == "tr" else "English")
         sep_keys = ("auto", "comma", "semicolon", "tab")
         self._separator_labels = {self._t("sep_" + key): key for key in sep_keys}
@@ -1325,6 +1445,12 @@ class PDFInventoryApp:
             self._mark_path_dirty(path)
         self._update_language()
         self._refresh_table(full=True)
+
+    def _on_resource_level_change(self) -> None:
+        self.resource_governor.set_level(self.resource_level_var.get())
+        if not self.is_scanning:  # Mid-scan, the progress text is more useful than this notice.
+            self._set_status("status_resources", level=self._t("level_" + self.resource_governor.level),
+                             workers=self.resource_governor.profile.workers)
 
     def _on_separator_change(self, _event: Any = None) -> None:
         self.csv_separator = self._separator_labels.get(self.separator_combo.get(), "auto")
@@ -1394,7 +1520,8 @@ class PDFInventoryApp:
             self._set_status("status_cancelling")
 
     def _scan_worker(self, root_path: Path) -> None:
-        scan_folder(root_path, self._cancel_event, lambda kind, payload: self._queue.put((kind, payload)))
+        scan_folder(root_path, self._cancel_event, lambda kind, payload: self._queue.put((kind, payload)),
+                    self.resource_governor)
 
     def _poll_worker_queue(self) -> None:
         if self._closing:

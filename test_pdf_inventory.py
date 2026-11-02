@@ -13,9 +13,10 @@ from unittest import mock
 import pdf_inventory as inv
 from pdf_inventory import (
     MAX_IN_FLIGHT_PER_WORKER,
-    MAX_SCAN_WORKERS,
     MAX_UI_QUEUE_EVENTS,
+    RESOURCE_LEVELS,
     RenamePlan,
+    ResourceGovernor,
     _full_hash,
     _quick_hash,
     apply_renames,
@@ -31,6 +32,7 @@ from pdf_inventory import (
     plan_renames,
     preflight_renames,
     resolve_csv_delimiter,
+    resource_profile,
     run_renames,
     sanitize_csv_cell,
     scan_folder,
@@ -89,10 +91,81 @@ class EntryWithoutJunctionCheck:
 
 
 class InventoryHelpersTest(unittest.TestCase):
-    def test_scan_concurrency_is_fixed_and_bounded(self):
-        self.assertEqual(MAX_SCAN_WORKERS, 4)
-        self.assertEqual(MAX_SCAN_WORKERS * MAX_IN_FLIGHT_PER_WORKER, 8)
+    def test_scan_concurrency_is_bounded(self):
+        self.assertEqual(MAX_IN_FLIGHT_PER_WORKER, 2)
         self.assertEqual(MAX_UI_QUEUE_EVENTS, 512)
+
+
+class ResourceLevelTest(unittest.TestCase):
+    def test_levels_scale_with_the_cpu_count_and_stay_ordered(self):
+        for cpus in (1, 2, 4, 8, 16, 64):
+            low, medium, high = (resource_profile(level, cpus) for level in RESOURCE_LEVELS)
+            self.assertGreaterEqual(low.workers, 1)
+            self.assertLessEqual(low.workers, medium.workers)
+            self.assertLessEqual(medium.workers, high.workers)
+            self.assertLessEqual(high.workers, 16)
+            self.assertLess(low.hash_chunk, medium.hash_chunk)
+            self.assertLess(medium.hash_chunk, high.hash_chunk)
+            self.assertTrue(low.background_priority)
+            self.assertFalse(medium.background_priority or high.background_priority)
+        self.assertEqual(resource_profile("medium", 8).workers, 4)
+        self.assertEqual(resource_profile("high", 8).workers, 8)
+        self.assertEqual(resource_profile("low", 2).workers, 1)
+
+    def test_governor_defaults_to_medium_and_changes_priority_only_when_needed(self):
+        governor = ResourceGovernor(cpus=8)
+        self.assertEqual(governor.level, "medium")
+        self.assertEqual(ResourceGovernor("bogus", cpus=8).level, "medium")
+        with mock.patch.object(inv, "apply_process_priority") as priority:
+            governor.set_level("high")
+            priority.assert_not_called()
+            governor.set_level("low")
+            priority.assert_called_once_with(True)
+            governor.set_level("medium")
+            priority.assert_called_with(False)
+        with self.assertRaises(ValueError):
+            governor.set_level("turbo")
+
+    def test_bounded_map_never_runs_more_tasks_than_the_level_allows(self):
+        governor = ResourceGovernor("low", cpus=8)
+        lock = threading.Lock()
+        running = peak = 0
+
+        def work(item):
+            nonlocal running, peak
+            with lock:
+                running += 1
+                peak = max(peak, running)
+            time.sleep(0.01)
+            with lock:
+                running -= 1
+            return item
+
+        results = []
+        self.assertTrue(bounded_map(work, range(30), threading.Event(),
+                                    lambda item, result, error: results.append(result), governor=governor))
+        self.assertEqual(sorted(results), list(range(30)))
+        self.assertLessEqual(peak, resource_profile("low", 8).workers)
+
+    def test_a_level_change_applies_to_a_running_map(self):
+        governor = ResourceGovernor("low", cpus=8)
+        names: set = set()
+        results = []
+
+        def work(item):
+            names.add(threading.current_thread().name)
+            time.sleep(0.005)
+            return item
+
+        def on_result(item, result, error):
+            results.append(result)
+            if len(results) == 5:
+                governor.set_level("high")
+
+        with mock.patch.object(inv, "apply_process_priority"):
+            self.assertTrue(bounded_map(work, range(60), threading.Event(), on_result, governor=governor))
+        self.assertEqual(sorted(results), list(range(60)))
+        self.assertGreater(len(names), resource_profile("low", 8).workers)
 
     def test_hashes_are_stable_and_full_hash_honors_cancellation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -722,6 +795,28 @@ class AppTest(AppTestCase):
         self.assertEqual(app.target_directory, os.path.normpath(str(self.library)))
         app._save_settings()
         self.assertNotIn("target_directory", json.loads(settings.read_text(encoding="utf-8")))
+
+    def test_resource_menu_starts_at_medium_and_reaches_the_scanner(self):
+        self.assertEqual(self.app.resource_governor.level, "medium")
+        self.assertEqual(self.app.resource_level_var.get(), "medium")
+        self.assertEqual(self.app.tools_menu.entrycget(3, "label"), "Resource usage")
+        self.assertTrue(self.app.resources_menu.entrycget(3, "label").startswith("Medium"))
+
+        with mock.patch.object(inv, "apply_process_priority") as priority:
+            self.app.resource_level_var.set("low")
+            self.app._on_resource_level_change()
+        priority.assert_called_once_with(True)
+        self.assertEqual(self.app.resource_governor.level, "low")
+        self.assertIn("Resource usage set to Low", self.app.lbl_status.cget("text"))
+
+        (self.library / "a.pdf").write_bytes(b"a")
+        with mock.patch.object(inv, "scan_folder", wraps=inv.scan_folder) as scanner:
+            self.scan()
+        self.assertIs(scanner.call_args.args[3], self.app.resource_governor)
+        self.app._save_settings()
+        self.assertNotIn("resource_level", json.loads((self.data_dir / "settings.json").read_text(encoding="utf-8")))
+        with mock.patch.object(inv, "apply_process_priority"):
+            self.app.resource_governor.set_level("medium")
 
     def test_off_screen_saved_position_is_replaced(self):
         (self.data_dir / "settings.json").write_text('{"geometry": "1180x760+-9000+-9000"}', encoding="utf-8")

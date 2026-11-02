@@ -30,6 +30,16 @@ The app always starts with the folder that contains `pdf_inventory.py` as the ta
 - **Problem** explains why a row is marked Corrupted, Encrypted or Unreadable, using the PDF library's own message. A PDF that takes longer than two minutes to read is reported as unreadable instead of stalling the scan.
 - **Skipped folders.** Folder links and junctions are not followed, so nothing is listed twice. System folders such as `C:\Windows`, `$RECYCLE.BIN` and folders without access are skipped too. A library folder that merely has a system-like name, such as `Books\Windows`, is still scanned. After a scan, **Skipped folders (N)** in the status bar lists what was skipped and why.
 
+**Tools → Resource usage** sets how hard a scan works the computer. The thread counts shown in the menu are worked out from this PC's processor count:
+
+| Level | Scan threads | Notes |
+| --- | --- | --- |
+| Low | 1–2 | Smallest reads and below-normal process priority (Windows), so other programs stay responsive |
+| Medium (default) | half the processors, 2–6 | Balances scan speed with keeping the PC usable |
+| High | one per processor, 4–16 | Largest reads; fastest on big libraries and network drives |
+
+You can change the level during a scan, and it applies right away. The app always starts on Medium; the choice is not saved.
+
 **Export visible rows** saves the current rows to CSV, including the problem text and the exact size in bytes. Export becomes available when a scan finishes.
 
 ## Cleaning PDF filenames
