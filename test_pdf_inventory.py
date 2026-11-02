@@ -818,6 +818,26 @@ class AppTest(AppTestCase):
         with mock.patch.object(inv, "apply_process_priority"):
             self.app.resource_governor.set_level("medium")
 
+    def test_tools_are_on_the_main_window_and_follow_the_menu(self):
+        self.assertEqual(str(self.app.btn_clean.cget("state")), tk.DISABLED)
+        self.assertEqual(str(self.app.btn_undo.cget("state")), tk.NORMAL)
+        self.assertTrue(self.app.resource_combo.get().startswith("Medium"))
+        self.assertIn("Kerem Aydın", self.app.lbl_credit.cget("text"))
+
+        (self.library / "a.pdf").write_bytes(b"a")
+        self.scan()
+        self.assertEqual(str(self.app.btn_clean.cget("state")), tk.NORMAL)
+
+        with mock.patch.object(inv, "apply_process_priority"):
+            high = next(label for label, level in self.app._resource_labels.items() if level == "high")
+            self.app.resource_combo.set(high)
+            self.app._on_resource_combo_change()
+            self.assertEqual(self.app.resource_governor.level, "high")
+            self.assertEqual(self.app.resource_level_var.get(), "high")
+            self.app.resource_level_var.set("medium")
+            self.app._on_resource_level_change()
+        self.assertTrue(self.app.resource_combo.get().startswith("Medium"))
+
     def test_off_screen_saved_position_is_replaced(self):
         (self.data_dir / "settings.json").write_text('{"geometry": "1180x760+-9000+-9000"}', encoding="utf-8")
         root = tk.Tk()

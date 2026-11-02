@@ -1,6 +1,6 @@
 # PDF Master Suite — Inventory
 
-A cross-platform desktop app for scanning folders of PDF files. It shows page counts, sizes and modified dates, finds duplicate files, lets you filter and sort the results, exports the visible rows to CSV, and can clean download-site tags out of PDF filenames.
+An open-source, cross-platform desktop app for scanning folders of PDF files, coded by [Kerem Aydın](https://keremaydin.net). It shows page counts, sizes and modified dates, finds duplicate files, lets you filter and sort the results, exports the visible rows to CSV, and can clean download-site tags out of PDF filenames.
 
 ## Requirements
 
@@ -30,7 +30,9 @@ The app always starts with the folder that contains `pdf_inventory.py` as the ta
 - **Problem** explains why a row is marked Corrupted, Encrypted or Unreadable, using the PDF library's own message. A PDF that takes longer than two minutes to read is reported as unreadable instead of stalling the scan.
 - **Skipped folders.** Folder links and junctions are not followed, so nothing is listed twice. System folders such as `C:\Windows`, `$RECYCLE.BIN` and folders without access are skipped too. A library folder that merely has a system-like name, such as `Books\Windows`, is still scanned. After a scan, **Skipped folders (N)** in the status bar lists what was skipped and why.
 
-**Tools → Resource usage** sets how hard a scan works the computer. The thread counts shown in the menu are worked out from this PC's processor count:
+The **Tools** row under the scan controls holds the same actions as the **Tools** menu: **Clean PDF filenames…**, **Undo a filename cleanup…** and the **Resource usage** level.
+
+**Tools → Resource usage** (or the Resource usage list in the Tools row) sets how hard a scan works the computer. The thread counts shown in the menu are worked out from this PC's processor count:
 
 | Level | Scan threads | Notes |
 | --- | --- | --- |
@@ -92,3 +94,7 @@ python -m unittest -v
 ```
 
 The same checks run for pull requests and pushes to `main` through GitHub Actions: on Windows with Python 3.10–3.13, plus Windows and Ubuntu jobs with `pypdf` installed.
+
+## Author
+
+PDF Master Suite is an open-source project coded by Kerem Aydın — [keremaydin.net](https://keremaydin.net). The credit line at the bottom of the window and **Help → About…** link to the same site.

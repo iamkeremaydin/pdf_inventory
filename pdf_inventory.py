@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""PDF Master Suite - responsive PDF inventory for Windows, macOS and Linux."""
+"""PDF Master Suite - responsive PDF inventory for Windows, macOS and Linux.
+
+Open-source project by Kerem Aydın (https://keremaydin.net).
+"""
 from __future__ import annotations
 
 import csv
@@ -17,6 +20,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import webbrowser
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -130,6 +134,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "level_high": "High",
         "tool_clean": "Clean PDF filenames…",
         "tool_undo": "Undo a filename cleanup…",
+        "tools_label": "Tools",
+        "resource_choice": "{level} · {workers} thread(s)",
+        "menu_help": "Help",
+        "menu_about": "About…",
+        "about_title": "About PDF Master Suite",
+        "about_text": "PDF Master Suite — Inventory\n\nAn open-source project coded by Kerem Aydın.\nhttps://keremaydin.net",
+        "credit": "Open-source project by Kerem Aydın · keremaydin.net",
         "clean_title": "Clean PDF filenames",
         "clean_intro": "Removes the “(Z-Library)” and “(z-library.sk, 1lib.sk, z-lib.sk)” tags from the end of PDF names among the {total} visible rows. Only names change; file contents are never modified. A report is saved so you can undo the renames with Tools → Undo a filename cleanup.",
         "clean_none": "None of the {total} visible PDF names ends with a supported Z-Library tag.",
@@ -246,6 +257,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "level_high": "Yüksek",
         "tool_clean": "PDF dosya adlarını temizle…",
         "tool_undo": "Dosya adı temizliğini geri al…",
+        "tools_label": "Araçlar",
+        "resource_choice": "{level} · {workers} iş parçacığı",
+        "menu_help": "Yardım",
+        "menu_about": "Hakkında…",
+        "about_title": "PDF Master Suite hakkında",
+        "about_text": "PDF Master Suite — Envanter\n\nKerem Aydın tarafından kodlanmış açık kaynaklı bir projedir.\nhttps://keremaydin.net",
+        "credit": "Kerem Aydın tarafından geliştirilen açık kaynaklı proje · keremaydin.net",
         "clean_title": "PDF dosya adlarını temizle",
         "clean_intro": "Görünen {total} satırdaki PDF adlarının sonundaki “(Z-Library)” ve “(z-library.sk, 1lib.sk, z-lib.sk)” etiketlerini kaldırır. Yalnızca adlar değişir; dosya içerikleri asla değiştirilmez. Yeniden adlandırmaları Araçlar → Dosya adı temizliğini geri al ile geri alabilmeniz için bir rapor kaydedilir.",
         "clean_none": "Görünen {total} PDF adından hiçbiri desteklenen bir Z-Library etiketiyle bitmiyor.",
@@ -1055,6 +1073,9 @@ def geometry_is_visible(geometry: str, screen: tuple[int, int, int, int]) -> boo
             and left <= grab_x < right and top <= grab_y < bottom)
 
 
+AUTHOR_URL = "https://keremaydin.net"
+
+
 def one_line(text: str, limit: int = 300) -> str:
     """Collapse whitespace so multi-line parser errors fit in one table cell."""
     flat = " ".join(str(text).split())
@@ -1216,6 +1237,7 @@ class PDFInventoryApp:
         style.configure("TLabel", background="#252a31", foreground="#e5e7eb", font=("Segoe UI", 10))
         style.configure("Muted.TLabel", background="#252a31", foreground="#a7b0bd", font=("Segoe UI", 9))
         style.configure("Count.TLabel", background="#202329", foreground="#b9c2ce", font=("Segoe UI", 9))
+        style.configure("Credit.TLabel", background="#202329", foreground="#7f8a99", font=("Segoe UI", 8))
         style.configure("TEntry", fieldbackground="#171b21", foreground="#f3f4f6", insertcolor="#ffffff",
                         bordercolor="#424a55", lightcolor="#424a55", darkcolor="#424a55", padding=6)
         style.map("TEntry", fieldbackground=[("disabled", "#252a31")], foreground=[("disabled", "#888f99")])
@@ -1264,8 +1286,12 @@ class PDFInventoryApp:
             self.resources_menu.add_radiobutton(variable=self.resource_level_var, value=level,
                                                 command=self._on_resource_level_change)
         self.tools_menu.add_cascade(menu=self.resources_menu)
+        self.help_menu = tk.Menu(self.menubar, tearoff=False)
+        self.help_menu.add_command(command=self._show_about)
+        self.help_menu.add_command(command=lambda: webbrowser.open(AUTHOR_URL))
         self.menubar.add_cascade(menu=self.file_menu)
         self.menubar.add_cascade(menu=self.tools_menu)
+        self.menubar.add_cascade(menu=self.help_menu)
         self.root.configure(menu=self.menubar)
 
     def _setup_ui(self) -> None:
@@ -1300,6 +1326,21 @@ class PDFInventoryApp:
         self.btn_export.pack(side=tk.RIGHT, padx=(self._px(7), 0))
         self.btn_scan = ttk.Button(controls, style="Success.TButton", command=self._start_scan)
         self.btn_scan.pack(side=tk.RIGHT, padx=(self._px(7), 0))
+
+        # Mirrors the Tools menu so its actions are visible without opening the menu.
+        tools_row = ttk.Frame(self.top_frame, style="Panel.TFrame")
+        tools_row.pack(fill=tk.X, pady=(self._px(10), 0))
+        self.lbl_tools = ttk.Label(tools_row, style="Muted.TLabel")
+        self.lbl_tools.pack(side=tk.LEFT, padx=(0, self._px(8)))
+        self.btn_clean = ttk.Button(tools_row, style="Accent.TButton", command=self._open_filename_cleaner)
+        self.btn_clean.pack(side=tk.LEFT, padx=(0, self._px(7)))
+        self.btn_undo = ttk.Button(tools_row, style="Neutral.TButton", command=self._open_cleanup_undo)
+        self.btn_undo.pack(side=tk.LEFT)
+        self.resource_combo = ttk.Combobox(tools_row, state="readonly", width=24)
+        self.resource_combo.pack(side=tk.RIGHT)
+        self.resource_combo.bind("<<ComboboxSelected>>", self._on_resource_combo_change)
+        self.lbl_resources = ttk.Label(tools_row, style="Muted.TLabel")
+        self.lbl_resources.pack(side=tk.RIGHT, padx=(0, self._px(6)))
 
         search_row = ttk.Frame(self.root, style="TFrame", padding=(self._px(16), self._px(10)))
         search_row.pack(fill=tk.X)
@@ -1347,6 +1388,12 @@ class PDFInventoryApp:
         self.tree.bind("<Return>", self._open_selected)
         self.tree.bind("<Button-3>", self._show_context_menu)
         self.tree.bind("<Button-2>", self._show_context_menu)
+
+        footer = ttk.Frame(self.root, style="TFrame", padding=(self._px(16), self._px(3)))
+        footer.pack(fill=tk.X, side=tk.BOTTOM)
+        self.lbl_credit = ttk.Label(footer, style="Credit.TLabel", cursor="hand2")
+        self.lbl_credit.pack(side=tk.RIGHT)
+        self.lbl_credit.bind("<Button-1>", lambda _e: webbrowser.open(AUTHOR_URL))
 
         bottom = ttk.Frame(self.root, style="Panel.TFrame", padding=(self._px(16), self._px(9)))
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
@@ -1398,6 +1445,21 @@ class PDFInventoryApp:
         self.btn_skipped.config(text=self._t("skipped_button", count=len(self._skipped_folders)))
         self.menubar.entryconfigure(0, label=self._t("menu_file"))
         self.menubar.entryconfigure(1, label=self._t("menu_tools"))
+        self.menubar.entryconfigure(2, label=self._t("menu_help"))
+        self.help_menu.entryconfigure(0, label=self._t("menu_about"))
+        self.help_menu.entryconfigure(1, label="keremaydin.net")
+        self.lbl_tools.config(text=self._t("tools_label"))
+        self.btn_clean.config(text=self._t("tool_clean"))
+        self.btn_undo.config(text=self._t("tool_undo"))
+        self.lbl_resources.config(text=self._t("menu_resources"))
+        self.lbl_credit.config(text=self._t("credit"))
+        self._resource_labels = {
+            self._t("resource_choice", level=self._t("level_" + level),
+                    workers=resource_profile(level, self.resource_governor.cpus).workers): level
+            for level in RESOURCE_LEVELS
+        }
+        self.resource_combo.configure(values=list(self._resource_labels.keys()))
+        self._sync_resource_combo()
         self.file_menu.entryconfigure(0, label=self._t("menu_select_folder"))
         self.file_menu.entryconfigure(2, label=self._t("export"))
         self.file_menu.entryconfigure(4, label=self._t("menu_exit"))
@@ -1436,6 +1498,8 @@ class PDFInventoryApp:
         self.file_menu.entryconfigure(2, state=tk.NORMAL if idle and has_rows else tk.DISABLED)
         self.tools_menu.entryconfigure(0, state=tk.NORMAL if idle and has_rows else tk.DISABLED)
         self.tools_menu.entryconfigure(1, state=tk.NORMAL if idle else tk.DISABLED)
+        self.btn_clean.configure(state=tk.NORMAL if idle and has_rows else tk.DISABLED)
+        self.btn_undo.configure(state=tk.NORMAL if idle else tk.DISABLED)
 
     def _on_language_change(self, _event: Any = None) -> None:
         self.current_lang = "tr" if self.lang_combo.get() == "Türkçe" else "en"
@@ -1446,8 +1510,17 @@ class PDFInventoryApp:
         self._update_language()
         self._refresh_table(full=True)
 
+    def _sync_resource_combo(self) -> None:
+        level = self.resource_level_var.get()
+        self.resource_combo.set(next(label for label, key in self._resource_labels.items() if key == level))
+
+    def _on_resource_combo_change(self, _event: Any = None) -> None:
+        self.resource_level_var.set(self._resource_labels.get(self.resource_combo.get(), DEFAULT_RESOURCE_LEVEL))
+        self._on_resource_level_change()
+
     def _on_resource_level_change(self) -> None:
         self.resource_governor.set_level(self.resource_level_var.get())
+        self._sync_resource_combo()
         if not self.is_scanning:  # Mid-scan, the progress text is more useful than this notice.
             self._set_status("status_resources", level=self._t("level_" + self.resource_governor.level),
                              workers=self.resource_governor.profile.workers)
@@ -2129,6 +2202,9 @@ class PDFInventoryApp:
         self._refresh_table(full=True)
 
     # ---------- Lifecycle ----------
+    def _show_about(self) -> None:
+        messagebox.showinfo(self._t("about_title"), self._t("about_text"), parent=self.root)
+
     def _on_close(self) -> None:
         self._closing = True
         if self.is_scanning:
