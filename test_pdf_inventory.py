@@ -818,6 +818,30 @@ class AppTest(AppTestCase):
         with mock.patch.object(inv, "apply_process_priority"):
             self.app.resource_governor.set_level("medium")
 
+    def test_resource_change_during_a_scan_is_announced_next_to_the_progress(self):
+        self.app.is_scanning = True
+        self.app._set_status("status_scanning", current=3, total=10)
+        with mock.patch.object(inv, "apply_process_priority"):
+            self.app.resource_level_var.set("high")
+            self.app._on_resource_level_change()
+            text = self.app.lbl_status.cget("text")
+            self.assertTrue(text.startswith("Inspecting PDFs: 3/10"))
+            self.assertIn("Speed increased to High", text)
+            self.assertEqual(self.app.resource_governor.level, "high")
+
+            # The notice stays while progress updates arrive.
+            self.app._set_status("status_scanning", current=4, total=10)
+            self.assertIn("Speed increased to High", self.app.lbl_status.cget("text"))
+
+            self.app.resource_level_var.set("low")
+            self.app._on_resource_level_change()
+            self.assertIn("Speed lowered to Low", self.app.lbl_status.cget("text"))
+
+            self.app._expire_resource_notice()
+            self.assertEqual(self.app.lbl_status.cget("text"), "Inspecting PDFs: 4/10")
+            self.app.resource_governor.set_level("medium")
+        self.app.is_scanning = False
+
     def test_tools_are_on_the_main_window_and_follow_the_menu(self):
         self.assertEqual(str(self.app.btn_clean.cget("state")), tk.DISABLED)
         self.assertEqual(str(self.app.btn_undo.cget("state")), tk.NORMAL)

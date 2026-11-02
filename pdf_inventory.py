@@ -128,7 +128,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "resource_low": "Low — {workers} thread(s), background priority",
         "resource_medium": "Medium — {workers} threads (default)",
         "resource_high": "High — {workers} threads, fastest",
-        "status_resources": "Resource usage set to {level}: {workers} scan threads.",
+        "status_resources": "Resource usage set to {level}: {workers} scan threads. You can also change it during a scan.",
+        "resource_notice_up": "Speed increased to {level} ({workers} threads), applied to the remaining files",
+        "resource_notice_down": "Speed lowered to {level} ({workers} threads), applied to the remaining files",
         "level_low": "Low",
         "level_medium": "Medium",
         "level_high": "High",
@@ -251,7 +253,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "resource_low": "Düşük — {workers} iş parçacığı, arka plan önceliği",
         "resource_medium": "Orta — {workers} iş parçacığı (varsayılan)",
         "resource_high": "Yüksek — {workers} iş parçacığı, en hızlı",
-        "status_resources": "Kaynak kullanımı: {level}, {workers} tarama iş parçacığı.",
+        "status_resources": "Kaynak kullanımı: {level}, {workers} tarama iş parçacığı. Tarama sırasında da değiştirilebilir.",
+        "resource_notice_up": "Hız {level} seviyesine yükseltildi ({workers} iş parçacığı), kalan dosyalara uygulanıyor",
+        "resource_notice_down": "Hız {level} seviyesine düşürüldü ({workers} iş parçacığı), kalan dosyalara uygulanıyor",
         "level_low": "Düşük",
         "level_medium": "Orta",
         "level_high": "Yüksek",
@@ -326,6 +330,8 @@ MAX_UI_QUEUE_EVENTS = 512
 INSPECT_TIMEOUT_SECONDS = 120
 # Sorted or filtered tables rebuild at most this often while a scan streams in new rows.
 SCAN_TABLE_REFRESH_SECONDS = 1.0
+# How long a mid-scan resource level change stays visible next to the progress text.
+RESOURCE_NOTICE_SECONDS = 8.0
 
 
 @dataclass(frozen=True)
@@ -1127,6 +1133,9 @@ class PDFInventoryApp:
         # Not saved: every launch starts at the default level, whatever the last session used.
         self.resource_governor = ResourceGovernor()
         self.resource_level_var = tk.StringVar(value=self.resource_governor.level)
+        self._resource_notice: tuple[str, dict[str, Any]] | None = None
+        self._resource_notice_until = 0.0
+        self._resource_notice_job: str | None = None
 
         self._setup_window()
         self._setup_styles()
@@ -1519,11 +1528,29 @@ class PDFInventoryApp:
         self._on_resource_level_change()
 
     def _on_resource_level_change(self) -> None:
+        previous = self.resource_governor.level
         self.resource_governor.set_level(self.resource_level_var.get())
         self._sync_resource_combo()
-        if not self.is_scanning:  # Mid-scan, the progress text is more useful than this notice.
-            self._set_status("status_resources", level=self._t("level_" + self.resource_governor.level),
-                             workers=self.resource_governor.profile.workers)
+        level = self.resource_governor.level
+        details = {"level": self._t("level_" + level), "workers": self.resource_governor.profile.workers}
+        if not self.is_scanning:
+            self._set_status("status_resources", **details)
+            return
+        if level == previous:
+            return
+        # Mid-scan the progress text keeps updating, so the notice rides along with it for a while.
+        faster = RESOURCE_LEVELS.index(level) > RESOURCE_LEVELS.index(previous)
+        self._resource_notice = ("resource_notice_up" if faster else "resource_notice_down", details)
+        self._resource_notice_until = time.monotonic() + RESOURCE_NOTICE_SECONDS
+        if self._resource_notice_job is not None:
+            self.root.after_cancel(self._resource_notice_job)
+        self._resource_notice_job = self.root.after(int(RESOURCE_NOTICE_SECONDS * 1000), self._expire_resource_notice)
+        self._render_last_status()
+
+    def _expire_resource_notice(self) -> None:
+        self._resource_notice_job = None
+        self._resource_notice = None
+        self._render_last_status()
 
     def _on_separator_change(self, _event: Any = None) -> None:
         self.csv_separator = self._separator_labels.get(self.separator_combo.get(), "auto")
@@ -1540,6 +1567,10 @@ class PDFInventoryApp:
         text = self._t(key, **kwargs)
         if not PYPDF_AVAILABLE and key in {"status_ready", "status_done", "status_cancelled", "status_no_pdf"}:
             text += self._t("status_missing_library")
+        if (self.is_scanning and self._resource_notice is not None
+                and time.monotonic() < self._resource_notice_until):
+            notice_key, notice_kwargs = self._resource_notice
+            text += "  ·  " + self._t(notice_key, **notice_kwargs)
         self.lbl_status.config(text=text)
 
     # ---------- Folder and scan controls ----------
@@ -1658,6 +1689,7 @@ class PDFInventoryApp:
 
     def _finish_scan(self, summary: dict[str, Any]) -> None:
         self.is_scanning = False
+        self._resource_notice = None  # Belongs to this scan's progress text only.
         self.progress.stop()
         self.progress.configure(mode="determinate", maximum=100)
         self.progress.configure(value=100 if self.records else 0)
@@ -2210,6 +2242,8 @@ class PDFInventoryApp:
         if self.is_scanning:
             self._cancel_event.set()
         self._save_settings()
+        if self._resource_notice_job is not None:
+            self.root.after_cancel(self._resource_notice_job)
         self.root.destroy()
 
 

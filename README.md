@@ -40,7 +40,7 @@ The **Tools** row under the scan controls holds the same actions as the **Tools*
 | Medium (default) | half the processors, 2–6 | Balances scan speed with keeping the PC usable |
 | High | one per processor, 4–16 | Largest reads; fastest on big libraries and network drives |
 
-You can change the level during a scan, and it applies right away. The app always starts on Medium; the choice is not saved.
+You can pick the level before a scan or change it while a scan is running. A change during a scan applies to the files that are still waiting; files already being read finish at the old speed. The status bar confirms the change next to the progress for a few seconds, for example "Speed increased to High (8 threads), applied to the remaining files". The app always starts on Medium; the choice is not saved.
 
 **Export visible rows** saves the current rows to CSV, including the problem text and the exact size in bytes. Export becomes available when a scan finishes.
 
