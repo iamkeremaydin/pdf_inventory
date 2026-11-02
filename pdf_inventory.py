@@ -5,15 +5,18 @@ Open-source project by Kerem Aydın (https://keremaydin.net).
 """
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import json
 import locale
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import os
 import queue
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -21,8 +24,10 @@ import threading
 import time
 import unicodedata
 import webbrowser
+import zlib
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
@@ -60,8 +65,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "scan": "Start scan",
         "cancel_scan": "Cancel scan",
         "export": "Export visible rows",
-        "search": "Search",
-        "search_hint": "Name, folder or path…",
+        "search_hint": "Search name, folder or path…",
         "clear": "Clear",
         "duplicates_only": "Duplicates only",
         "col_name": "File name",
@@ -136,7 +140,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "level_high": "High",
         "tool_clean": "Clean PDF filenames…",
         "tool_undo": "Undo a filename cleanup…",
-        "tools_label": "Tools",
+        "btn_clean": "Clean names…",
+        "btn_export": "Export CSV",
+        "settings_hint": "Settings: language and CSV separator",
+        "empty_hint": "Choose a folder, then press Start scan (Ctrl+R).",
         "resource_choice": "{level} · {workers} thread(s)",
         "menu_help": "Help",
         "menu_about": "About…",
@@ -185,8 +192,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "scan": "Taramayı başlat",
         "cancel_scan": "Taramayı iptal et",
         "export": "Görünen satırları aktar",
-        "search": "Ara",
-        "search_hint": "Ad, klasör veya yol…",
+        "search_hint": "Ad, klasör veya yolda ara…",
         "clear": "Temizle",
         "duplicates_only": "Yalnızca yinelenenler",
         "col_name": "Dosya adı",
@@ -261,7 +267,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "level_high": "Yüksek",
         "tool_clean": "PDF dosya adlarını temizle…",
         "tool_undo": "Dosya adı temizliğini geri al…",
-        "tools_label": "Araçlar",
+        "btn_clean": "Adları temizle…",
+        "btn_export": "CSV olarak aktar",
+        "settings_hint": "Ayarlar: dil ve CSV ayırıcı",
+        "empty_hint": "Bir klasör seçin, ardından Taramayı başlat'a basın (Ctrl+R).",
         "resource_choice": "{level} · {workers} iş parçacığı",
         "menu_help": "Yardım",
         "menu_about": "Hakkında…",
@@ -332,6 +341,8 @@ INSPECT_TIMEOUT_SECONDS = 120
 SCAN_TABLE_REFRESH_SECONDS = 1.0
 # How long a mid-scan resource level change stays visible next to the progress text.
 RESOURCE_NOTICE_SECONDS = 8.0
+LANGUAGE_NAMES = {"en": "English", "tr": "Türkçe"}
+CSV_SEPARATORS = ("auto", "comma", "semicolon", "tab")
 
 
 @dataclass(frozen=True)
@@ -1088,6 +1099,172 @@ def one_line(text: str, limit: int = 300) -> str:
     return flat if len(flat) <= limit else flat[:limit - 1] + "…"
 
 
+# Dark theme palette shared by the main window, dialogs, menus and icons.
+COLORS = {
+    "window": "#17191d", "bg": "#202329", "panel": "#252a31", "field": "#171b21",
+    "table": "#1b1f25", "table_alt": "#20252c", "heading": "#2b313a", "heading_hover": "#36404c",
+    "border": "#3a414b", "button": "#343b45", "button_hover": "#414955", "button_disabled": "#2b3037",
+    "accent": "#2563eb", "accent_hover": "#1d4ed8", "danger": "#b42318", "danger_hover": "#912018",
+    "select": "#244d78", "text": "#e5e7eb", "text_strong": "#f3f4f6", "muted": "#a7b0bd",
+    "faint": "#7f8a99", "disabled": "#7b828c", "white": "#ffffff", "tooltip": "#2f353e",
+    "error": "#ff7777", "warning": "#f0be67", "unreadable": "#ff9999", "pdf": "#e5484d",
+}
+
+# Icons are drawn on a 24-unit grid with a 2-unit stroke, then rasterised at the display scale so they
+# stay sharp at any DPI without image files. Shape kinds: "line" (polyline), "ring" (circle outline),
+# "arc" (cx, cy, r, start, end in degrees clockwise from +x) and "box" (rounded-rectangle outline) are
+# stroked; "disc", "poly" (points, corner rounding) and "fbox" are filled. An optional third item
+# paints the shape in that colour instead of the icon colour.
+ICONS: dict[str, list[tuple[Any, ...]]] = {
+    "folder": [("line", ((3, 19), (3, 5), (9, 5), (11, 7), (21, 7), (21, 19), (3, 19)))],
+    "play": [("poly", (((8, 5.5), (18.5, 12), (8, 18.5)), 1.5))],
+    "stop": [("fbox", (6.5, 6.5, 17.5, 17.5, 2))],
+    "gauge": [("arc", (12, 14, 9, 150, 390)), ("line", ((12, 14), (16, 9))), ("disc", (12, 14, 1.8))],
+    "gear": [("line", tuple(
+        (12 + radius * math.cos(math.radians(tooth * 45 + offset)),
+         12 + radius * math.sin(math.radians(tooth * 45 + offset)))
+        for tooth in range(8) for offset, radius in ((-22.5, 7.2), (-12, 7.2), (-8, 10), (8, 10), (12, 7.2))
+    ) + ((12 + 7.2 * math.cos(math.radians(-22.5)), 12 + 7.2 * math.sin(math.radians(-22.5))),)),
+             ("ring", (12, 12, 3))],
+    "search": [("ring", (10.5, 10.5, 6.5)), ("line", ((15.5, 15.5), (20.5, 20.5)))],
+    "close": [("line", ((7.5, 7.5), (16.5, 16.5))), ("line", ((16.5, 7.5), (7.5, 16.5)))],
+    "eraser": [("line", ((4, 15), (13, 6), (19.5, 12.5), (11, 21), (8, 21), (4, 17), (4, 15))),
+               ("line", ((8.5, 10.5), (15, 17))), ("line", ((11, 21), (21, 21)))],
+    "undo": [("line", ((9, 14), (4, 9), (9, 4))), ("line", ((4, 9), (14.5, 9))),
+             ("arc", (14.5, 14.5, 5.5, -90, 90)), ("line", ((14.5, 20), (11, 20)))],
+    "export": [("line", ((12, 21), (5, 21), (5, 3), (13, 3), (17, 7), (17, 10))),
+               ("line", ((13, 3), (13, 7), (17, 7))), ("line", ((10, 15.5), (21, 15.5))),
+               ("line", ((17.5, 12), (21, 15.5), (17.5, 19)))],
+    "warning": [("line", ((12, 3.5), (21.5, 20), (2.5, 20), (12, 3.5))), ("line", ((12, 9.5), (12, 13.5))),
+                ("disc", (12, 16.8, 1.3))],
+    "app": [("poly", (((5, 2.5), (14.5, 2.5), (20, 8), (20, 21.5), (5, 21.5)), 1), COLORS["pdf"]),
+            ("poly", (((14.5, 2.5), (14.5, 8), (20, 8)), 0.5), "#ffb3b5"),
+            ("fbox", (8, 11.5, 17, 13, 0.75), COLORS["white"]),
+            ("fbox", (8, 14.75, 17, 16.25, 0.75), COLORS["white"]),
+            ("fbox", (8, 18, 13.5, 19.5, 0.75), COLORS["white"])],
+}
+STROKED_SHAPES = {"line", "ring", "arc", "box"}
+
+
+def _segment_distance(x: float, y: float, a: tuple[float, float], b: tuple[float, float]) -> float:
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = dx * dx + dy * dy
+    t = 0.0 if length == 0 else max(0.0, min(1.0, ((x - a[0]) * dx + (y - a[1]) * dy) / length))
+    return math.hypot(x - a[0] - t * dx, y - a[1] - t * dy)
+
+
+def _shape_distance(kind: str, params: Any, x: float, y: float) -> float:
+    """Distance in grid units from (x, y) to a stroked shape, or signed distance to a filled one."""
+    if kind == "line":
+        return min(_segment_distance(x, y, a, b) for a, b in zip(params, params[1:]))
+    if kind in {"ring", "disc"}:
+        cx, cy, radius = params
+        distance = math.hypot(x - cx, y - cy) - radius
+        return abs(distance) if kind == "ring" else distance
+    if kind == "arc":
+        cx, cy, radius, start, end = params
+        if (math.degrees(math.atan2(y - cy, x - cx)) - start) % 360 <= end - start:
+            return abs(math.hypot(x - cx, y - cy) - radius)
+        return min(math.hypot(x - cx - radius * math.cos(math.radians(a)), y - cy - radius * math.sin(math.radians(a)))
+                   for a in (start, end))
+    if kind in {"box", "fbox"}:
+        x0, y0, x1, y1, radius = params
+        qx = abs(x - (x0 + x1) / 2) - ((x1 - x0) / 2 - radius)
+        qy = abs(y - (y0 + y1) / 2) - ((y1 - y0) / 2 - radius)
+        distance = math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - radius
+        return abs(distance) if kind == "box" else distance
+    points, rounding = params
+    edges = list(zip(points, points[1:] + points[:1]))
+    distance = min(_segment_distance(x, y, a, b) for a, b in edges)
+    inside = False
+    for (ax, ay), (bx, by) in edges:
+        if (ay > y) != (by > y) and x < ax + (y - ay) * (bx - ax) / (by - ay):
+            inside = not inside
+    return (-distance if inside else distance) - rounding
+
+
+def render_icon_png(shapes: Sequence[tuple[Any, ...]], size: int, color: str, gap: int = 0) -> bytes:
+    """Rasterise an icon to an anti-aliased RGBA PNG, with `gap` transparent columns on the right."""
+    scale = size / 24
+    raw = bytearray()
+    for row in range(size):
+        raw.append(0)  # PNG filter type: none.
+        y = (row + 0.5) / scale
+        for column in range(size):
+            x = (column + 0.5) / scale
+            red = green = blue = alpha = 0.0  # Premultiplied.
+            for shape in shapes:
+                distance = _shape_distance(shape[0], shape[1], x, y) * scale
+                # A 2-unit stroke reaches `scale` pixels either side of the centre line.
+                edge = scale - abs(distance) if shape[0] in STROKED_SHAPES else -distance
+                coverage = max(0.0, min(1.0, edge + 0.5))
+                if coverage:
+                    paint = shape[2] if len(shape) > 2 else color
+                    r, g, b = int(paint[1:3], 16), int(paint[3:5], 16), int(paint[5:7], 16)
+                    keep = 1.0 - coverage
+                    red, green, blue = r * coverage + red * keep, g * coverage + green * keep, b * coverage + blue * keep
+                    alpha = coverage + alpha * keep
+            if alpha:
+                raw += bytes((round(red / alpha), round(green / alpha), round(blue / alpha), round(alpha * 255)))
+            else:
+                raw += b"\0\0\0\0"
+        raw += b"\0\0\0\0" * gap
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", size + gap, size, 8, 6, 0, 0, 0)  # 8-bit RGBA.
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+
+
+@lru_cache(maxsize=None)
+def icon_png(name: str, size: int, color: str, gap: int = 0) -> bytes:
+    """Cached so windows opened later in the same process, such as in tests, skip rasterising."""
+    return render_icon_png(ICONS[name], size, color, gap)
+
+
+class Tooltip:
+    """Show a short hint below a widget once the pointer rests on it."""
+
+    DELAY_MS = 550
+
+    def __init__(self, widget: tk.Misc, text: Callable[[], str]):
+        self.widget = widget
+        self.text = text  # Called on every show, so a language change is picked up.
+        self._job: str | None = None
+        self._tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event: Any = None) -> None:
+        self._hide()
+        self._job = self.widget.after(self.DELAY_MS, self._show)
+
+    def _show(self) -> None:
+        self._job = None
+        text = self.text()
+        if not text or not self.widget.winfo_viewable():
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_attributes("-topmost", True)
+        tk.Label(tip, text=text, bg=COLORS["tooltip"], fg=COLORS["text_strong"], font=("Segoe UI", 9),
+                 padx=8, pady=4, highlightthickness=1, highlightbackground=COLORS["border"]).pack()
+        tip.update_idletasks()
+        x = min(self.widget.winfo_rootx(), self.widget.winfo_screenwidth() - tip.winfo_reqwidth() - 4)
+        tip.wm_geometry(f"+{max(0, x)}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}")
+        self._tip = tip
+
+    def _hide(self, _event: Any = None) -> None:
+        if self._job is not None:
+            self.widget.after_cancel(self._job)
+            self._job = None
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
 class PDFInventoryApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1100,7 +1277,7 @@ class PDFInventoryApp:
         # starting it there scans that library. Browse… changes the folder for this session only.
         self.target_directory = str(program_dir())
         self.csv_separator = self.settings.get("csv_separator", "auto")
-        if self.csv_separator not in {"auto", "comma", "semicolon", "tab"}:
+        if self.csv_separator not in CSV_SEPARATORS:
             self.csv_separator = "auto"
         self.last_export_dir = self.settings.get("last_export_dir", self.target_directory)
         # Records stay in arrival order; the unsorted table shows them in this order.
@@ -1136,6 +1313,11 @@ class PDFInventoryApp:
         self._resource_notice: tuple[str, dict[str, Any]] | None = None
         self._resource_notice_until = 0.0
         self._resource_notice_job: str | None = None
+        self.language_var = tk.StringVar(value=self.current_lang)
+        self.separator_var = tk.StringVar(value=self.csv_separator)
+        self._has_scanned = False
+        # PhotoImages vanish when Python drops the last reference, so the app keeps every icon here.
+        self._images: dict[tuple[str, int, str, int], tk.PhotoImage] = {}
 
         self._setup_window()
         self._setup_styles()
@@ -1215,6 +1397,22 @@ class PDFInventoryApp:
         """Convert design pixels using the detected display scale."""
         return max(1, round(value * self._ui_scale))
 
+    def _photo(self, name: str, size: int, color: str, gap: int = 0) -> tk.PhotoImage:
+        key = (name, size, color, gap)
+        image = self._images.get(key)
+        if image is None:
+            data = base64.b64encode(icon_png(name, size, color, gap)).decode("ascii")
+            image = self._images[key] = tk.PhotoImage(master=self.root, data=data)
+        return image
+
+    def _icon(self, name: str, color: str = COLORS["text"], label: bool = True) -> tuple[Any, ...]:
+        """Image option for a ttk button: the icon in `color`, greyed out while the button is disabled.
+
+        Icons beside a label get a transparent gap on the right, since ttk puts no space between them.
+        """
+        size, gap = self._px(16), self._px(6) if label else 0
+        return (self._photo(name, size, color, gap), "disabled", self._photo(name, size, COLORS["disabled"], gap))
+
     # ---------- Window, style and interface ----------
     def _setup_window(self) -> None:
         self.root.update_idletasks()
@@ -1223,7 +1421,7 @@ class PDFInventoryApp:
         except tk.TclError:
             self._ui_scale = 1.0
         width, height = self._px(1180), self._px(760)
-        self.root.minsize(self._px(850), self._px(520))
+        self.root.minsize(self._px(900), self._px(520))
         geometry = self.settings.get("geometry")
         # A saved position can be off-screen after a monitor is disconnected or rearranged.
         if isinstance(geometry, str) and geometry_is_visible(geometry, virtual_screen_bounds(self.root)):
@@ -1232,48 +1430,90 @@ class PDFInventoryApp:
             x = max(0, (self.root.winfo_screenwidth() - width) // 2)
             y = max(0, (self.root.winfo_screenheight() - height) // 2)
             self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.root.configure(bg="#17191d")
+        self.root.configure(bg=COLORS["window"])
+        # The window and taskbar icon; True makes dialogs inherit it.
+        self.root.iconphoto(True, *(self._photo("app", size, COLORS["pdf"]) for size in (16, 32, 64)))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _setup_styles(self) -> None:
+        c = COLORS
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TFrame", background="#202329")
-        style.configure("Panel.TFrame", background="#252a31")
-        style.configure("TLabel", background="#252a31", foreground="#e5e7eb", font=("Segoe UI", 10))
-        style.configure("Muted.TLabel", background="#252a31", foreground="#a7b0bd", font=("Segoe UI", 9))
-        style.configure("Count.TLabel", background="#202329", foreground="#b9c2ce", font=("Segoe UI", 9))
-        style.configure("Credit.TLabel", background="#202329", foreground="#7f8a99", font=("Segoe UI", 8))
-        style.configure("TEntry", fieldbackground="#171b21", foreground="#f3f4f6", insertcolor="#ffffff",
-                        bordercolor="#424a55", lightcolor="#424a55", darkcolor="#424a55", padding=6)
-        style.map("TEntry", fieldbackground=[("disabled", "#252a31")], foreground=[("disabled", "#888f99")])
-        style.configure("TCombobox", fieldbackground="#171b21", background="#343b45", foreground="#f3f4f6",
-                        arrowcolor="#e5e7eb", bordercolor="#424a55", padding=5)
-        style.map("TCombobox", fieldbackground=[("readonly", "#171b21")], foreground=[("readonly", "#f3f4f6")],
-                  selectbackground=[("readonly", "#2563eb")], selectforeground=[("readonly", "#ffffff")])
-        style.configure("Treeview", background="#1b1f25", fieldbackground="#1b1f25", foreground="#e5e7eb",
-                        rowheight=self._px(29), borderwidth=0, font=("Segoe UI", 9))
-        style.configure("Treeview.Heading", background="#303741", foreground="#f3f4f6",
-                        relief="flat", font=("Segoe UI", 9, "bold"), padding=(8, 8))
-        style.map("Treeview.Heading", background=[("active", "#3b4654")])
-        style.map("Treeview", background=[("selected", "#244d78")], foreground=[("selected", "#ffffff")])
-        style.configure("Vertical.TScrollbar", background="#343b45", troughcolor="#1b1f25",
-                        bordercolor="#1b1f25", arrowcolor="#d1d5db")
-        style.configure("Horizontal.TScrollbar", background="#343b45", troughcolor="#1b1f25",
-                        bordercolor="#1b1f25", arrowcolor="#d1d5db")
-        for name, color, active in (
-            ("Accent", "#2563eb", "#1d4ed8"), ("Success", "#16834a", "#116b3b"),
-            ("Info", "#087f8c", "#066874"), ("Neutral", "#3b424c", "#4b5563"),
+        font, strong = ("Segoe UI", 9), ("Segoe UI Semibold", 9)
+        style.configure(".", background=c["bg"], foreground=c["text"], bordercolor=c["border"],
+                        troughcolor=c["field"], focuscolor=c["accent"], font=font)
+        style.configure("TFrame", background=c["bg"])
+        style.configure("Panel.TFrame", background=c["panel"])
+        style.configure("TLabel", background=c["panel"], foreground=c["text"], font=("Segoe UI", 10))
+        style.configure("Muted.TLabel", background=c["panel"], foreground=c["muted"], font=font)
+        style.configure("Count.TLabel", background=c["panel"], foreground=c["muted"], font=font)
+        style.configure("Credit.TLabel", background=c["bg"], foreground=c["faint"], font=("Segoe UI", 8))
+        style.configure("Icon.TLabel", background=c["panel"])
+        style.configure("Empty.TLabel", background=c["table"], foreground=c["faint"], font=("Segoe UI", 11))
+        style.configure("TSeparator", background=c["border"])
+        style.configure("TEntry", fieldbackground=c["field"], foreground=c["text_strong"], insertcolor=c["white"],
+                        bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"], padding=self._px(6))
+        style.map("TEntry", fieldbackground=[("disabled", c["panel"])], foreground=[("disabled", c["disabled"])])
+        # The search entry sits inside a frame that draws the border and the focus ring for it.
+        style.configure("Bare.TEntry", bordercolor=c["field"], lightcolor=c["field"], darkcolor=c["field"],
+                        padding=(self._px(2), self._px(6)))
+        style.configure("TCombobox", fieldbackground=c["field"], background=c["button"], foreground=c["text_strong"],
+                        arrowcolor=c["text"], bordercolor=c["border"], lightcolor=c["field"], darkcolor=c["field"],
+                        arrowsize=self._px(12), padding=(self._px(6), self._px(7)))
+        style.map("TCombobox", fieldbackground=[("readonly", c["field"])], foreground=[("readonly", c["text_strong"])],
+                  background=[("pressed", c["button_hover"]), ("active", c["button_hover"])],
+                  bordercolor=[("focus", c["accent"])],
+                  selectbackground=[("readonly", c["field"])], selectforeground=[("readonly", c["text_strong"])])
+        for option, value in (("background", c["field"]), ("foreground", c["text_strong"]),
+                              ("selectBackground", c["accent"]), ("selectForeground", c["white"])):
+            self.root.option_add(f"*TCombobox*Listbox.{option}", value)
+        style.configure("TCheckbutton", background=c["bg"], foreground=c["text"], indicatorbackground=c["field"],
+                        indicatorforeground=c["white"], upperbordercolor=c["border"], lowerbordercolor=c["border"],
+                        indicatorsize=self._px(14), indicatormargin=(0, 0, self._px(6), 0))
+        style.map("TCheckbutton", background=[("active", c["bg"])], foreground=[("disabled", c["disabled"])],
+                  indicatorbackground=[("selected", c["accent"]), ("pressed", c["button"])])
+        style.configure("Treeview", background=c["table"], fieldbackground=c["table"], foreground=c["text"],
+                        bordercolor=c["border"], lightcolor=c["table"], darkcolor=c["table"],
+                        rowheight=self._px(29), borderwidth=0, font=font)
+        style.map("Treeview", background=[("selected", c["select"])], foreground=[("selected", c["white"])])
+        style.configure("Treeview.Heading", background=c["heading"], foreground=c["text_strong"], relief="flat",
+                        bordercolor=c["border"], lightcolor=c["heading"], darkcolor=c["heading"],
+                        font=strong, padding=(self._px(2), self._px(7)))  # Lines headings up with cell text.
+        style.map("Treeview.Heading", background=[("active", c["heading_hover"])])
+        for orient in ("Vertical", "Horizontal"):
+            style.configure(f"{orient}.TScrollbar", background=c["button"], troughcolor=c["table"],
+                            bordercolor=c["table"], lightcolor=c["button"], darkcolor=c["button"],
+                            arrowcolor=c["muted"], gripcount=0, arrowsize=self._px(12))
+            style.map(f"{orient}.TScrollbar", background=[("active", c["button_hover"])],
+                      lightcolor=[("active", c["button_hover"])], darkcolor=[("active", c["button_hover"])])
+        # Only the scan button is filled with the accent colour; every other action is a quiet secondary button.
+        for name, color, hover, text, weight in (
+            ("Accent", c["accent"], c["accent_hover"], c["white"], strong),
+            ("Danger", c["danger"], c["danger_hover"], c["white"], strong),
+            ("Neutral", c["button"], c["button_hover"], c["text_strong"], font),
         ):
-            style.configure(f"{name}.TButton", background=color, foreground="#ffffff", borderwidth=0,
-                            focusthickness=0, padding=(12, 7), font=("Segoe UI", 9, "bold"))
-            style.map(f"{name}.TButton", background=[("disabled", "#41464e"), ("pressed", active), ("active", active)],
-                      foreground=[("disabled", "#9299a3")])
-        style.configure("TProgressbar", troughcolor="#171b21", background="#2c91e8",
-                        bordercolor="#171b21", lightcolor="#2c91e8", darkcolor="#2c91e8")
+            style.configure(f"{name}.TButton", background=color, foreground=text, borderwidth=1, bordercolor=color,
+                            lightcolor=color, darkcolor=color, focusthickness=0, focuscolor=color,
+                            padding=(self._px(12), self._px(6)), font=weight)
+            states = [("disabled", c["button_disabled"]), ("pressed", hover), ("active", hover)]
+            style.map(f"{name}.TButton", background=states, bordercolor=states, lightcolor=states, darkcolor=states,
+                      foreground=[("disabled", c["disabled"])])
+        style.configure("Icon.Neutral.TButton", padding=(self._px(7), self._px(6)))
+        style.configure("Link.TButton", background=c["panel"], foreground=c["warning"], borderwidth=0,
+                        bordercolor=c["panel"], lightcolor=c["panel"], darkcolor=c["panel"], focusthickness=0,
+                        focuscolor=c["panel"], padding=(self._px(6), self._px(2)), font=font)
+        style.map("Link.TButton", background=[("active", c["button"])], lightcolor=[("active", c["button"])],
+                  darkcolor=[("active", c["button"])], bordercolor=[("active", c["button"])])
+        style.configure("TProgressbar", troughcolor=c["field"], background=c["accent"], bordercolor=c["field"],
+                        lightcolor=c["accent"], darkcolor=c["accent"], thickness=self._px(6))
+
+    @staticmethod
+    def _popup_menu_colors() -> dict[str, str]:
+        return {"bg": COLORS["panel"], "fg": COLORS["text_strong"], "activebackground": COLORS["accent"],
+                "activeforeground": COLORS["white"], "selectcolor": COLORS["text_strong"]}
 
     def _setup_menu(self) -> None:
         # Labels are set in _update_language; entry indices below are referenced there.
@@ -1295,6 +1535,11 @@ class PDFInventoryApp:
             self.resources_menu.add_radiobutton(variable=self.resource_level_var, value=level,
                                                 command=self._on_resource_level_change)
         self.tools_menu.add_cascade(menu=self.resources_menu)
+        self.tools_menu.add_separator()
+        # The gear button in the command bar opens the same Language and CSV separator choices.
+        self.settings_menu = tk.Menu(self.root, tearoff=False, **self._popup_menu_colors())
+        self._settings_menus = [self._add_settings_entries(self.tools_menu, {}),
+                                self._add_settings_entries(self.settings_menu, self._popup_menu_colors())]
         self.help_menu = tk.Menu(self.menubar, tearoff=False)
         self.help_menu.add_command(command=self._show_about)
         self.help_menu.add_command(command=lambda: webbrowser.open(AUTHOR_URL))
@@ -1303,70 +1548,84 @@ class PDFInventoryApp:
         self.menubar.add_cascade(menu=self.help_menu)
         self.root.configure(menu=self.menubar)
 
+    def _add_settings_entries(self, menu: tk.Menu, colors: dict[str, str]) -> tuple[tk.Menu, int, tk.Menu]:
+        """Append Language and CSV separator submenus; return (menu, first entry index, separator submenu)."""
+        language_menu = tk.Menu(menu, tearoff=False, **colors)
+        for code, name in LANGUAGE_NAMES.items():
+            language_menu.add_radiobutton(label=name, variable=self.language_var, value=code,
+                                          command=self._on_language_change)
+        separator_menu = tk.Menu(menu, tearoff=False, **colors)
+        for key in CSV_SEPARATORS:
+            separator_menu.add_radiobutton(variable=self.separator_var, value=key, command=self._on_separator_change)
+        last = menu.index(tk.END)
+        menu.add_cascade(menu=language_menu)
+        menu.add_cascade(menu=separator_menu)
+        return menu, 0 if last is None else last + 1, separator_menu
+
     def _setup_ui(self) -> None:
-        self.top_frame = ttk.Frame(self.root, style="Panel.TFrame", padding=(self._px(16), self._px(13)))
+        # Command bar: the scan task reads left to right (where, how hard, go), then the settings gear.
+        self.top_frame = ttk.Frame(self.root, style="Panel.TFrame", padding=(self._px(16), self._px(12)))
         self.top_frame.pack(fill=tk.X)
-
-        path_row = ttk.Frame(self.top_frame, style="Panel.TFrame")
-        path_row.pack(fill=tk.X, pady=(0, self._px(10)))
-        self.lbl_target = ttk.Label(path_row, style="Muted.TLabel")
+        self.lbl_target = ttk.Label(self.top_frame, style="Muted.TLabel")
         self.lbl_target.pack(side=tk.LEFT, padx=(0, self._px(10)))
-        self.path_var = tk.StringVar(value=self.target_directory)
-        self.path_entry = ttk.Entry(path_row, textvariable=self.path_var, state="readonly")
-        self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self._px(10)))
-        self.btn_browse = ttk.Button(path_row, style="Neutral.TButton", command=self._select_folder)
-        self.btn_browse.pack(side=tk.RIGHT)
-
-        controls = ttk.Frame(self.top_frame, style="Panel.TFrame")
-        controls.pack(fill=tk.X)
-        self.lbl_lang = ttk.Label(controls, style="Muted.TLabel")
-        self.lbl_lang.pack(side=tk.LEFT, padx=(0, self._px(6)))
-        self.lang_combo = ttk.Combobox(controls, state="readonly", width=10, values=["English", "Türkçe"])
-        self.lang_combo.pack(side=tk.LEFT, padx=(0, self._px(18)))
-        self.lang_combo.bind("<<ComboboxSelected>>", self._on_language_change)
-
-        self.lbl_separator = ttk.Label(controls, style="Muted.TLabel")
-        self.lbl_separator.pack(side=tk.LEFT, padx=(0, self._px(6)))
-        self.separator_combo = ttk.Combobox(controls, state="readonly", width=18)
-        self.separator_combo.pack(side=tk.LEFT)
-        self.separator_combo.bind("<<ComboboxSelected>>", self._on_separator_change)
-
-        self.btn_export = ttk.Button(controls, style="Info.TButton", command=self._export_csv, state=tk.DISABLED)
-        self.btn_export.pack(side=tk.RIGHT, padx=(self._px(7), 0))
-        self.btn_scan = ttk.Button(controls, style="Success.TButton", command=self._start_scan)
-        self.btn_scan.pack(side=tk.RIGHT, padx=(self._px(7), 0))
-
-        # Mirrors the Tools menu so its actions are visible without opening the menu.
-        tools_row = ttk.Frame(self.top_frame, style="Panel.TFrame")
-        tools_row.pack(fill=tk.X, pady=(self._px(10), 0))
-        self.lbl_tools = ttk.Label(tools_row, style="Muted.TLabel")
-        self.lbl_tools.pack(side=tk.LEFT, padx=(0, self._px(8)))
-        self.btn_clean = ttk.Button(tools_row, style="Accent.TButton", command=self._open_filename_cleaner)
-        self.btn_clean.pack(side=tk.LEFT, padx=(0, self._px(7)))
-        self.btn_undo = ttk.Button(tools_row, style="Neutral.TButton", command=self._open_cleanup_undo)
-        self.btn_undo.pack(side=tk.LEFT)
-        self.resource_combo = ttk.Combobox(tools_row, state="readonly", width=24)
-        self.resource_combo.pack(side=tk.RIGHT)
+        self.btn_settings = ttk.Button(self.top_frame, style="Icon.Neutral.TButton",
+                                       image=self._icon("gear", label=False), command=self._show_settings_menu)
+        self.btn_settings.pack(side=tk.RIGHT, padx=(self._px(8), 0))
+        self.btn_scan = ttk.Button(self.top_frame, style="Accent.TButton", compound=tk.LEFT, command=self._start_scan)
+        self.btn_scan.pack(side=tk.RIGHT)
+        self.resource_combo = ttk.Combobox(self.top_frame, state="readonly", width=20)
+        self.resource_combo.pack(side=tk.RIGHT, padx=(0, self._px(8)))
         self.resource_combo.bind("<<ComboboxSelected>>", self._on_resource_combo_change)
-        self.lbl_resources = ttk.Label(tools_row, style="Muted.TLabel")
+        self.lbl_resources = ttk.Label(self.top_frame, style="Icon.TLabel",
+                                       image=self._photo("gauge", self._px(16), COLORS["muted"]))
         self.lbl_resources.pack(side=tk.RIGHT, padx=(0, self._px(6)))
+        ttk.Separator(self.top_frame, orient=tk.VERTICAL).pack(side=tk.RIGHT, fill=tk.Y, padx=self._px(12),
+                                                               pady=self._px(4))
+        self.btn_browse = ttk.Button(self.top_frame, style="Neutral.TButton", image=self._icon("folder"),
+                                     compound=tk.LEFT, command=self._select_folder)
+        self.btn_browse.pack(side=tk.RIGHT)
+        self.path_var = tk.StringVar(value=self.target_directory)
+        self.path_entry = ttk.Entry(self.top_frame, textvariable=self.path_var, state="readonly")
+        self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self._px(8)))
 
-        search_row = ttk.Frame(self.root, style="TFrame", padding=(self._px(16), self._px(10)))
-        search_row.pack(fill=tk.X)
-        self.lbl_search = ttk.Label(search_row, style="Muted.TLabel")
-        self.lbl_search.pack(side=tk.LEFT, padx=(0, self._px(8)))
+        # View bar: decides which rows are visible and holds the actions that work on exactly those rows.
+        view_bar = ttk.Frame(self.root, style="TFrame", padding=(self._px(16), self._px(10)))
+        view_bar.pack(fill=tk.X)
+        self.search_box = tk.Frame(view_bar, bg=COLORS["field"], highlightthickness=1,
+                                   highlightbackground=COLORS["border"], highlightcolor=COLORS["border"])
+        self.search_box.pack(side=tk.LEFT)
+        tk.Label(self.search_box, image=self._photo("search", self._px(16), COLORS["faint"]),
+                 bg=COLORS["field"]).pack(side=tk.LEFT, padx=(self._px(8), 0))
         self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(search_row, textvariable=self.search_var, width=36)
-        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=False)
+        self.search_entry = ttk.Entry(self.search_box, textvariable=self.search_var, width=34, style="Bare.TEntry")
+        self.search_entry.pack(side=tk.LEFT, padx=(self._px(2), 0))
         self.search_var.trace_add("write", self._on_search_changed)
-        self.btn_clear = ttk.Button(search_row, style="Neutral.TButton", command=self._clear_search)
-        self.btn_clear.pack(side=tk.LEFT, padx=(self._px(6), 0))
+        for sequence, color in (("<FocusIn>", COLORS["accent"]), ("<FocusOut>", COLORS["border"])):
+            self.search_entry.bind(sequence, lambda _e, c=color: self.search_box.configure(highlightbackground=c),
+                                   add="+")
+        self.search_placeholder = tk.Label(self.search_box, bg=COLORS["field"], fg=COLORS["faint"],
+                                           font=("Segoe UI", 9), cursor="xterm")
+        self.search_placeholder.bind("<Button-1>", lambda _e: self.search_entry.focus_set())
+        clear_size = self._px(14)
+        self._clear_icons = (self._photo("close", clear_size, COLORS["muted"]),
+                             tk.PhotoImage(master=self.root, width=clear_size, height=clear_size))
+        # Always packed so the box keeps its width; it shows a blank image while there is nothing to clear.
+        self.btn_clear = tk.Label(self.search_box, bg=COLORS["field"], image=self._clear_icons[1])
+        self.btn_clear.pack(side=tk.LEFT, padx=(self._px(2), self._px(8)))
+        self.btn_clear.bind("<Button-1>", lambda _e: self._clear_search())
         self.duplicates_only = ttk.Checkbutton(
-            search_row, variable=self.duplicates_only_var, command=self._on_filter_changed,
+            view_bar, variable=self.duplicates_only_var, command=self._on_filter_changed,
         )
-        self.duplicates_only.pack(side=tk.LEFT, padx=(self._px(12), 0))
-        self.count_label = ttk.Label(search_row, style="Count.TLabel")
-        self.count_label.pack(side=tk.RIGHT)
+        self.duplicates_only.pack(side=tk.LEFT, padx=(self._px(14), 0))
+        self.btn_export = ttk.Button(view_bar, style="Neutral.TButton", image=self._icon("export"), compound=tk.LEFT,
+                                     command=self._export_csv, state=tk.DISABLED)
+        self.btn_export.pack(side=tk.RIGHT)
+        self.btn_undo = ttk.Button(view_bar, style="Icon.Neutral.TButton", image=self._icon("undo", label=False),
+                                   command=self._open_cleanup_undo)
+        self.btn_undo.pack(side=tk.RIGHT, padx=(0, self._px(12)))
+        self.btn_clean = ttk.Button(view_bar, style="Neutral.TButton", image=self._icon("eraser"), compound=tk.LEFT,
+                                    command=self._open_filename_cleaner)
+        self.btn_clean.pack(side=tk.RIGHT, padx=(0, self._px(2)))
 
         table_frame = ttk.Frame(self.root, style="TFrame", padding=(self._px(16), 0, self._px(16), self._px(10)))
         table_frame.pack(fill=tk.BOTH, expand=True)
@@ -1376,15 +1635,17 @@ class PDFInventoryApp:
         widths = {"name": 235, "folder": 150, "size": 92, "pages": 76, "date": 142, "duplicate": 130,
                   "problem": 200, "path": 390}
         for column in self.columns:
-            self.tree.column(column, width=self._px(widths[column]), minwidth=self._px(60),
-                             anchor=tk.CENTER if column in {"size", "pages", "date", "duplicate"} else tk.W,
+            # Numbers align right so their digits line up, and the fixed-width date is centred so it keeps
+            # clear of the page counts; headings follow their column.
+            anchor = tk.E if column in {"size", "pages"} else tk.CENTER if column == "date" else tk.W
+            self.tree.column(column, width=self._px(widths[column]), minwidth=self._px(60), anchor=anchor,
                              stretch=column in {"name", "path"})
-            self.tree.heading(column, text="", command=lambda c=column: self._sort_by(c))
-        self.tree.tag_configure("even", background="#1b1f25")
-        self.tree.tag_configure("odd", background="#20252c")
-        self.tree.tag_configure("corrupted", foreground="#ff7777")
-        self.tree.tag_configure("encrypted", foreground="#f0be67")
-        self.tree.tag_configure("unreadable", foreground="#ff9999")
+            self.tree.heading(column, text="", anchor=anchor, command=lambda c=column: self._sort_by(c))
+        self.tree.tag_configure("even", background=COLORS["table"])
+        self.tree.tag_configure("odd", background=COLORS["table_alt"])
+        self.tree.tag_configure("corrupted", foreground=COLORS["error"])
+        self.tree.tag_configure("encrypted", foreground=COLORS["warning"])
+        self.tree.tag_configure("unreadable", foreground=COLORS["unreadable"])
         scrollbar_y = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
         scrollbar_x = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
         self.tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
@@ -1397,6 +1658,8 @@ class PDFInventoryApp:
         self.tree.bind("<Return>", self._open_selected)
         self.tree.bind("<Button-3>", self._show_context_menu)
         self.tree.bind("<Button-2>", self._show_context_menu)
+        # Shown over the table only while it is empty; see _update_count_label.
+        self.empty_hint = ttk.Label(table_frame, style="Empty.TLabel", justify=tk.CENTER)
 
         footer = ttk.Frame(self.root, style="TFrame", padding=(self._px(16), self._px(3)))
         footer.pack(fill=tk.X, side=tk.BOTTOM)
@@ -1404,17 +1667,59 @@ class PDFInventoryApp:
         self.lbl_credit.pack(side=tk.RIGHT)
         self.lbl_credit.bind("<Button-1>", lambda _e: webbrowser.open(AUTHOR_URL))
 
-        bottom = ttk.Frame(self.root, style="Panel.TFrame", padding=(self._px(16), self._px(9)))
+        # Status bar: message on the left; skipped folders, row count and progress on the right.
+        bottom = ttk.Frame(self.root, style="Panel.TFrame", padding=(self._px(16), self._px(7)))
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
+        # Packed before the message so a long status text cannot squeeze these out.
+        status_right = ttk.Frame(bottom, style="Panel.TFrame")
+        status_right.pack(side=tk.RIGHT)
+        # Packed only after a scan that skipped folders; see _finish_scan.
+        self.btn_skipped = ttk.Button(status_right, style="Link.TButton", compound=tk.LEFT,
+                                      image=self._photo("warning", self._px(16), COLORS["warning"], self._px(6)),
+                                      command=self._show_skipped_folders)
+        self.count_label = ttk.Label(status_right, style="Count.TLabel")
+        self.count_label.pack(side=tk.LEFT)
+        # Packed only while a scan runs; see _start_scan and _finish_scan.
+        self.progress = ttk.Progressbar(status_right, orient=tk.HORIZONTAL, length=self._px(220), mode="determinate")
         self.lbl_status = ttk.Label(bottom, style="Muted.TLabel", anchor=tk.W)
         self.lbl_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.progress = ttk.Progressbar(bottom, orient=tk.HORIZONTAL, length=self._px(280), mode="determinate")
-        self.progress.pack(side=tk.RIGHT, padx=(self._px(12), 0))
-        # Packed only after a scan that skipped folders; see _finish_scan.
-        self.btn_skipped = ttk.Button(bottom, style="Neutral.TButton", command=self._show_skipped_folders)
 
+        def shortcut(key: str, combo: str) -> Callable[[], str]:
+            return lambda: f"{self._t(key)}  ({combo})"
+
+        self._tooltips = [
+            Tooltip(self.btn_browse, shortcut("choose_folder", "Ctrl+O")),
+            Tooltip(self.lbl_resources, lambda: self._t("menu_resources")),
+            Tooltip(self.resource_combo, lambda: self._t("menu_resources")),
+            Tooltip(self.btn_scan, lambda: shortcut("cancel_scan" if self.is_scanning else "scan", "Ctrl+R")()),
+            Tooltip(self.btn_settings, lambda: self._t("settings_hint")),
+            Tooltip(self.btn_clear, lambda: f"{self._t('clear')}  (Esc)" if self.search_var.get() else ""),
+            Tooltip(self.btn_clean, lambda: self._t("tool_clean")),
+            Tooltip(self.btn_undo, lambda: self._t("tool_undo")),
+            Tooltip(self.btn_export, shortcut("export", "Ctrl+E")),
+        ]
         self._bind_shortcuts()
+        self._sync_search_box()
         self._update_count_label()
+
+    def _show_settings_menu(self) -> None:
+        button = self.btn_settings
+        self.settings_menu.update_idletasks()
+        # Right-aligned under the gear, which sits at the window's right edge.
+        x = button.winfo_rootx() + button.winfo_width() - self.settings_menu.winfo_reqwidth()
+        try:
+            self.settings_menu.tk_popup(max(0, x), button.winfo_rooty() + button.winfo_height())
+        finally:
+            self.settings_menu.grab_release()
+
+    def _sync_search_box(self) -> None:
+        """Show the placeholder while the search box is empty and the clear button while it is not."""
+        if self.search_var.get():
+            self.search_placeholder.place_forget()
+            self.btn_clear.configure(image=self._clear_icons[0], cursor="hand2")
+        else:
+            self.search_placeholder.place(in_=self.search_entry, x=self._px(3), rely=0.5, anchor=tk.W)
+            self.btn_clear.configure(image=self._clear_icons[1], cursor="")
 
     def _bind_shortcuts(self) -> None:
         def when_no_dialog(handler: Callable[[Any], Any]) -> Callable[[Any], Any]:
@@ -1444,12 +1749,9 @@ class PDFInventoryApp:
     def _update_language(self) -> None:
         self.root.title(self._t("title"))
         self.lbl_target.config(text=self._t("target_dir"))
-        self.lbl_lang.config(text=self._t("language"))
-        self.lbl_separator.config(text=self._t("csv_separator"))
-        self.lbl_search.config(text=self._t("search"))
         self.btn_browse.config(text=self._t("browse"))
-        self.btn_export.config(text=self._t("export"))
-        self.btn_clear.config(text=self._t("clear"))
+        self.btn_export.config(text=self._t("btn_export"))
+        self.search_placeholder.config(text=self._t("search_hint"))
         self.duplicates_only.config(text=self._t("duplicates_only"))
         self.btn_skipped.config(text=self._t("skipped_button", count=len(self._skipped_folders)))
         self.menubar.entryconfigure(0, label=self._t("menu_file"))
@@ -1457,10 +1759,7 @@ class PDFInventoryApp:
         self.menubar.entryconfigure(2, label=self._t("menu_help"))
         self.help_menu.entryconfigure(0, label=self._t("menu_about"))
         self.help_menu.entryconfigure(1, label="keremaydin.net")
-        self.lbl_tools.config(text=self._t("tools_label"))
-        self.btn_clean.config(text=self._t("tool_clean"))
-        self.btn_undo.config(text=self._t("tool_undo"))
-        self.lbl_resources.config(text=self._t("menu_resources"))
+        self.btn_clean.config(text=self._t("btn_clean"))
         self.lbl_credit.config(text=self._t("credit"))
         self._resource_labels = {
             self._t("resource_choice", level=self._t("level_" + level),
@@ -1479,11 +1778,13 @@ class PDFInventoryApp:
         for index, level in enumerate(RESOURCE_LEVELS, start=2):
             workers = resource_profile(level, self.resource_governor.cpus).workers
             self.resources_menu.entryconfigure(index, label=self._t("resource_" + level, workers=workers))
-        self.lang_combo.set("Türkçe" if self.current_lang == "tr" else "English")
-        sep_keys = ("auto", "comma", "semicolon", "tab")
-        self._separator_labels = {self._t("sep_" + key): key for key in sep_keys}
-        self.separator_combo.configure(values=list(self._separator_labels.keys()))
-        self.separator_combo.set(next(label for label, key in self._separator_labels.items() if key == self.csv_separator))
+        self.language_var.set(self.current_lang)
+        self.separator_var.set(self.csv_separator)
+        for menu, first, separator_menu in self._settings_menus:
+            menu.entryconfigure(first, label=self._t("language"))
+            menu.entryconfigure(first + 1, label=self._t("csv_separator"))
+            for index, key in enumerate(CSV_SEPARATORS):
+                separator_menu.entryconfigure(index, label=self._t("sep_" + key))
         for column in self.columns:
             heading = self._t("col_" + column)
             if self._sort_column == column:
@@ -1499,7 +1800,10 @@ class PDFInventoryApp:
         has_rows = bool(self.records)
         cancelling = self.is_scanning and self._cancel_event.is_set()
         scan_label = self._t("cancel_scan" if self.is_scanning else "scan")
-        self.btn_scan.configure(text=scan_label, state=tk.DISABLED if cancelling else tk.NORMAL)
+        # While scanning the primary button turns into a red Cancel scan with a stop icon.
+        self.btn_scan.configure(text=scan_label, state=tk.DISABLED if cancelling else tk.NORMAL,
+                                style="Danger.TButton" if self.is_scanning else "Accent.TButton",
+                                image=self._icon("stop" if self.is_scanning else "play", COLORS["white"]))
         self.btn_browse.configure(state=tk.NORMAL if idle else tk.DISABLED)
         self.btn_export.configure(state=tk.NORMAL if idle and has_rows else tk.DISABLED)
         self.file_menu.entryconfigure(0, state=tk.NORMAL if idle else tk.DISABLED)
@@ -1510,8 +1814,8 @@ class PDFInventoryApp:
         self.btn_clean.configure(state=tk.NORMAL if idle and has_rows else tk.DISABLED)
         self.btn_undo.configure(state=tk.NORMAL if idle else tk.DISABLED)
 
-    def _on_language_change(self, _event: Any = None) -> None:
-        self.current_lang = "tr" if self.lang_combo.get() == "Türkçe" else "en"
+    def _on_language_change(self) -> None:
+        self.current_lang = self.language_var.get() if self.language_var.get() in TRANSLATIONS else "en"
         self._save_settings()
         self._search_keys.clear()  # Page and duplicate labels are part of the search text.
         for path in self.records:
@@ -1552,8 +1856,8 @@ class PDFInventoryApp:
         self._resource_notice = None
         self._render_last_status()
 
-    def _on_separator_change(self, _event: Any = None) -> None:
-        self.csv_separator = self._separator_labels.get(self.separator_combo.get(), "auto")
+    def _on_separator_change(self) -> None:
+        self.csv_separator = self.separator_var.get() if self.separator_var.get() in CSV_SEPARATORS else "auto"
         self._save_settings()
 
     def _set_status(self, key: str, **kwargs: Any) -> None:
@@ -1609,6 +1913,7 @@ class PDFInventoryApp:
         self.btn_skipped.pack_forget()
         self.progress.stop()
         self.progress.configure(mode="indeterminate", maximum=100)
+        self.progress.pack(side=tk.LEFT, padx=(self._px(12), 0))
         self.progress.start(12)
         self.is_scanning = True
         self._update_language()
@@ -1690,9 +1995,10 @@ class PDFInventoryApp:
     def _finish_scan(self, summary: dict[str, Any]) -> None:
         self.is_scanning = False
         self._resource_notice = None  # Belongs to this scan's progress text only.
+        self._has_scanned = True
         self.progress.stop()
-        self.progress.configure(mode="determinate", maximum=100)
-        self.progress.configure(value=100 if self.records else 0)
+        self.progress.configure(mode="determinate", maximum=100, value=0)
+        self.progress.pack_forget()
         self._update_action_states()
         # "Checking…" becomes "Unknown" once the scan ends, which changes the cell and search text.
         for path, record in self.records.items():
@@ -1703,8 +2009,7 @@ class PDFInventoryApp:
         self._skipped_folders = list(summary.get("skipped_folders", []))
         if self._skipped_folders:
             self.btn_skipped.config(text=self._t("skipped_button", count=len(self._skipped_folders)))
-            # Packed before the status label so a long status message cannot squeeze it out.
-            self.btn_skipped.pack(side=tk.RIGHT, padx=(self._px(12), 0), before=self.lbl_status)
+            self.btn_skipped.pack(side=tk.LEFT, padx=(0, self._px(14)), before=self.count_label)
         count = len(self.records)
         duplicates, groups, reclaimable = self._duplicate_summary()
         corrupt = sum(1 for rec in self.records.values() if rec.get("page_state") == "corrupt")
@@ -1751,6 +2056,7 @@ class PDFInventoryApp:
             self._pending_render_set.add(path)
 
     def _on_search_changed(self, *_args: Any) -> None:
+        self._sync_search_box()
         if self._search_after_id:
             try:
                 self.root.after_cancel(self._search_after_id)
@@ -1971,6 +2277,11 @@ class PDFInventoryApp:
         # _visible_paths always mirrors the table, so counting it costs nothing on idle ticks.
         self.count_label.config(text=self._t("count_label", visible=len(self._visible_paths),
                                              total=len(self.records)))
+        if self.records or self.is_scanning:
+            self.empty_hint.place_forget()
+        else:
+            self.empty_hint.config(text=self._t("status_no_pdf" if self._has_scanned else "empty_hint"))
+            self.empty_hint.place(in_=self.tree, relx=0.5, rely=0.5, anchor=tk.CENTER)
 
     # ---------- Context actions and keyboard shortcuts ----------
     def _show_context_menu(self, event: Any) -> str:
@@ -1978,8 +2289,7 @@ class PDFInventoryApp:
         if row:
             if row not in self.tree.selection():
                 self.tree.selection_set(row)
-            menu = tk.Menu(self.root, tearoff=False, bg="#252a31", fg="#f3f4f6",
-                           activebackground="#2563eb", activeforeground="#ffffff")
+            menu = tk.Menu(self.root, tearoff=False, **self._popup_menu_colors())
             menu.add_command(label=self._t("open_file"), command=self._open_selected)
             menu.add_command(label=self._t("open_folder"), command=self._open_selected_folder)
             menu.add_separator()
@@ -2110,7 +2420,7 @@ class PDFInventoryApp:
         ready = sum(1 for plan in plans if plan.status == "ready")
         dialog = tk.Toplevel(self.root)
         dialog.title(self._t("clean_title" if action == "clean" else "undo_title"))
-        dialog.configure(bg="#252a31")
+        dialog.configure(bg=COLORS["panel"])
         dialog.transient(self.root)
         dialog.minsize(self._px(640), self._px(360))
         width, height = self._px(960), self._px(540)
@@ -2134,7 +2444,7 @@ class PDFInventoryApp:
             tree.heading(column, text=self._t("col_" + column))
             tree.column(column, width=self._px(widths[column]), minwidth=self._px(80), anchor=tk.W,
                         stretch=column != "status")
-        tree.tag_configure("blocked", foreground="#f0be67")
+        tree.tag_configure("blocked", foreground=COLORS["warning"])
         for index, plan in enumerate(plans):
             stripe = "even" if index % 2 == 0 else "odd"
             tags = (stripe,) if plan.status == "ready" else (stripe, "blocked")
@@ -2142,8 +2452,8 @@ class PDFInventoryApp:
                 self._t("rename_status_" + plan.status), plan.source.name,
                 plan.destination.name if plan.destination else "", self._folder_label(plan.source.parent),
             ), tags=tags)
-        tree.tag_configure("even", background="#1b1f25")
-        tree.tag_configure("odd", background="#20252c")
+        tree.tag_configure("even", background=COLORS["table"])
+        tree.tag_configure("odd", background=COLORS["table_alt"])
         scrollbar = ttk.Scrollbar(table, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)

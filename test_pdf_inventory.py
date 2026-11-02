@@ -862,6 +862,34 @@ class AppTest(AppTestCase):
             self.app._on_resource_level_change()
         self.assertTrue(self.app.resource_combo.get().startswith("Medium"))
 
+    def test_settings_gear_and_tools_menu_share_language_and_separator(self):
+        self.assertEqual(self.app.tools_menu.entrycget(5, "label"), "Language")
+        self.assertEqual(self.app.settings_menu.entrycget(1, "label"), "CSV separator")
+
+        self.app.language_var.set("tr")
+        self.app._on_language_change()
+        self.app.separator_var.set("semicolon")
+        self.app._on_separator_change()
+
+        self.assertEqual(self.app.btn_export.cget("text"), "CSV olarak aktar")
+        self.assertEqual(self.app.settings_menu.entrycget(0, "label"), "Dil")
+        saved = json.loads((self.data_dir / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual((saved["language"], saved["csv_separator"]), ("tr", "semicolon"))
+
+    def test_empty_hint_and_progress_show_only_while_relevant(self):
+        self.root.update_idletasks()
+        self.assertTrue(self.app.empty_hint.place_info())
+        self.assertIn("Start scan", self.app.empty_hint.cget("text"))
+        self.assertFalse(self.app.progress.winfo_manager())
+
+        self.scan()
+        self.assertIn("No PDF files", self.app.empty_hint.cget("text"))
+        (self.library / "a.pdf").write_bytes(b"a")
+        self.scan()
+
+        self.assertFalse(self.app.empty_hint.place_info())
+        self.assertFalse(self.app.progress.winfo_manager())
+
     def test_off_screen_saved_position_is_replaced(self):
         (self.data_dir / "settings.json").write_text('{"geometry": "1180x760+-9000+-9000"}', encoding="utf-8")
         root = tk.Tk()

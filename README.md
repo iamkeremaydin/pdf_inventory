@@ -22,6 +22,14 @@ python pdf_inventory.py
 
 The app does not require a build step.
 
+## The window
+
+- **Command bar** (top): the target folder and **Browse…**, the resource usage level (gauge icon), **Start scan** and the settings gear. The gear holds the **Language** and **CSV separator** choices, which are also under **Tools**.
+- **View bar** (above the table): the search box and **Duplicates only** decide which rows are visible; **Clean names…**, the undo button and **Export CSV** next to them work on exactly those rows.
+- **Status bar** (bottom): scan progress and results, **Skipped folders** when a scan skipped any, and the number of rows shown.
+
+Hover over a button to see what it does and its keyboard shortcut.
+
 ## Scanning a folder
 
 The app always starts with the folder that contains `pdf_inventory.py` as the target, so you can copy it into a PDF library and start it there. To scan somewhere else, choose a folder with **Browse…** (or **File → Select folder…**); that choice lasts until the app closes. Press **Start scan** to scan the folder and every subfolder.
@@ -30,9 +38,7 @@ The app always starts with the folder that contains `pdf_inventory.py` as the ta
 - **Problem** explains why a row is marked Corrupted, Encrypted or Unreadable, using the PDF library's own message. A PDF that takes longer than two minutes to read is reported as unreadable instead of stalling the scan.
 - **Skipped folders.** Folder links and junctions are not followed, so nothing is listed twice. System folders such as `C:\Windows`, `$RECYCLE.BIN` and folders without access are skipped too. A library folder that merely has a system-like name, such as `Books\Windows`, is still scanned. After a scan, **Skipped folders (N)** in the status bar lists what was skipped and why.
 
-The **Tools** row under the scan controls holds the same actions as the **Tools** menu: **Clean PDF filenames…**, **Undo a filename cleanup…** and the **Resource usage** level.
-
-**Tools → Resource usage** (or the Resource usage list in the Tools row) sets how hard a scan works the computer. The thread counts shown in the menu are worked out from this PC's processor count:
+**Tools → Resource usage** (or the list with the gauge icon next to **Start scan**) sets how hard a scan works the computer. The thread counts shown in the menu are worked out from this PC's processor count:
 
 | Level | Scan threads | Notes |
 | --- | --- | --- |
@@ -42,18 +48,18 @@ The **Tools** row under the scan controls holds the same actions as the **Tools*
 
 You can pick the level before a scan or change it while a scan is running. A change during a scan applies to the files that are still waiting; files already being read finish at the old speed. The status bar confirms the change next to the progress for a few seconds, for example "Speed increased to High (8 threads), applied to the remaining files". The app always starts on Medium; the choice is not saved.
 
-**Export visible rows** saves the current rows to CSV, including the problem text and the exact size in bytes. Export becomes available when a scan finishes.
+**Export CSV** (or **File → Export visible rows**) saves the current rows to CSV, including the problem text and the exact size in bytes. Export becomes available when a scan finishes.
 
 ## Cleaning PDF filenames
 
-**Tools → Clean PDF filenames…** removes these exact tags from the end of PDF names:
+**Clean names…** in the view bar (or **Tools → Clean PDF filenames…**) removes these exact tags from the end of PDF names:
 
 - `(Z-Library)`
 - `(z-library.sk, 1lib.sk, z-lib.sk)`
 
 It works on the rows currently visible in the table, so you can narrow the set with the search box first. A preview lists every planned rename. Names that would collide with an existing file, or with another cleaned name, are marked and skipped rather than overwritten. A tag followed by other text, such as `Book (Z-Library)_compressed.pdf`, is left alone. Nothing changes until you press **Rename N files**.
 
-Only names change; file contents are never opened for writing. Every run saves a report, and **Tools → Undo a filename cleanup…** restores the original names from any report, including reports made by the former `pdf_filename_cleaner.py` script.
+Only names change; file contents are never opened for writing. Every run saves a report, and the undo button next to **Clean names…** (or **Tools → Undo a filename cleanup…**) restores the original names from any report, including reports made by the former `pdf_filename_cleaner.py` script.
 
 ## Files the app writes (portable)
 
