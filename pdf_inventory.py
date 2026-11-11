@@ -35,6 +35,8 @@ from typing import Any, Callable, Iterable, Sequence
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+APP_VERSION = "MVP 1.0.0"
+
 
 # Keep optional PDF-library diagnostics quiet without suppressing unrelated warnings.
 logging.getLogger("pypdf").setLevel(logging.ERROR)
@@ -147,6 +149,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "resource_choice": "{level} · {workers} thread(s)",
         "menu_help": "Help",
         "menu_about": "About…",
+        "about_version": "Version {version}",
         "about_title": "About PDF Master Suite",
         "about_text": "PDF Master Suite — Inventory\n\nAn open-source project coded by Kerem Aydın.\nhttps://keremaydin.net",
         "credit": "Open-source project by Kerem Aydın · keremaydin.net",
@@ -274,6 +277,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "resource_choice": "{level} · {workers} iş parçacığı",
         "menu_help": "Yardım",
         "menu_about": "Hakkında…",
+        "about_version": "Sürüm {version}",
         "about_title": "PDF Master Suite hakkında",
         "about_text": "PDF Master Suite — Envanter\n\nKerem Aydın tarafından kodlanmış açık kaynaklı bir projedir.\nhttps://keremaydin.net",
         "credit": "Kerem Aydın tarafından geliştirilen açık kaynaklı proje · keremaydin.net",
@@ -1030,9 +1034,15 @@ DATA_DIR_NAME = "pdf_inventory_data"
 
 
 def program_dir() -> Path:
-    """Folder that contains the program: the script, or the executable when packaged."""
+    """Folder that contains the program: the script, or the executable when packaged.
+
+    A macOS .app bundle counts as one program, so its folder is the one that holds the bundle.
+    """
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        folder = Path(sys.executable).resolve().parent
+        if sys.platform == "darwin" and folder.parent.name == "Contents" and folder.parent.parent.suffix == ".app":
+            return folder.parent.parent.parent
+        return folder
     return Path(__file__).resolve().parent
 
 
@@ -2545,7 +2555,8 @@ class PDFInventoryApp:
 
     # ---------- Lifecycle ----------
     def _show_about(self) -> None:
-        messagebox.showinfo(self._t("about_title"), self._t("about_text"), parent=self.root)
+        text = f"{self._t('about_text')}\n\n{self._t('about_version', version=APP_VERSION)}"
+        messagebox.showinfo(self._t("about_title"), text, parent=self.root)
 
     def _on_close(self) -> None:
         self._closing = True

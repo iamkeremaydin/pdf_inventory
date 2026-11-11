@@ -238,6 +238,21 @@ class PortableModeTest(unittest.TestCase):
                 self.assertEqual(inv.program_dir(), executable.resolve().parent)
                 self.assertEqual(inv.app_data_dir(), executable.resolve().parent / "pdf_inventory_data")
 
+    def test_data_lives_next_to_a_macos_app_bundle_not_inside_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "PDF Inventory.app" / "Contents" / "MacOS" / "PDF Inventory"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            with mock.patch.object(inv.sys, "frozen", True, create=True), \
+                    mock.patch.object(inv.sys, "platform", "darwin"), \
+                    mock.patch.object(inv.sys, "executable", str(executable)):
+                self.assertEqual(inv.program_dir(), Path(directory).resolve())
+
+    def test_version_is_mvp_1_0_0(self):
+        self.assertEqual(inv.APP_VERSION, "MVP 1.0.0")
+        for lang in ("en", "tr"):
+            self.assertIn("{version}", inv.TRANSLATIONS[lang]["about_version"])
+
     def test_settings_reports_and_log_share_the_portable_folder(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(inv, "program_dir", lambda: Path(directory)):

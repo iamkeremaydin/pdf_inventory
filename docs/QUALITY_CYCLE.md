@@ -147,6 +147,23 @@ This iteration and Iteration 5 were done together at the maintainer's request. T
 - **Rollback:** Revert the iteration commit.
 - **Review date:** 2026-11-15.
 
+### Iteration 7 — public MVP 1.0.0 release
+
+- **Owner:** Repository maintainer.
+- **Reason:** The project is going public as open source and users without Python need a download for their system.
+- **Change:**
+  - Version `MVP 1.0.0` (`APP_VERSION`), shown in **Help → About…**.
+  - MIT `LICENSE`; a short `README.md`; all other documents under `docs/` (the former long README is `docs/USER_GUIDE.md`).
+  - A Release workflow builds unsigned Windows, macOS and Linux downloads with PyInstaller when a `v*` tag is pushed.
+  - A packaged macOS `.app` keeps `pdf_inventory_data` next to the bundle, not inside it, through `program_dir()`.
+- **Acceptance:**
+  - The tag must match `APP_VERSION` or the release is not created.
+  - The release carries one file per system.
+- **Verification:** Unit tests (including the macOS bundle path and version); the release run on GitHub.
+- **Known limit:** Builds are unsigned (backlog item G stays open for signing).
+- **Rollback:** Delete the release and tag; revert the iteration commit.
+- **Review date:** 2026-11-25.
+
 ## Filename cleaner history
 
 Before Iteration 5, the cleaner was a separate script with its own quality log (`PDF_CLEANER_QUALITY.md`, removed with the script; see the git history).
@@ -169,7 +186,7 @@ Its findings, as they stand now:
 
 ## Backlog
 
-Scoring follows `PDF_INVENTORY_ANALYSIS.md` §5:
+Scoring follows `PDF_INVENTORY_ANALYSIS.md` (same folder) §5:
 - **Value, Fit and Confidence** are scored 1–3, higher is better.
 - **Effort and Risk** are scored 1–3, higher is worse.
 - **Score = V × F × C ÷ (E × R).**
