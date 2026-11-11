@@ -97,8 +97,8 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 3
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q xvfb
+          # The runner image normally has Xvfb already; install it only when it is missing.
+          command -v xvfb-run >/dev/null || sudo apt-get install -y -q xvfb
           mkdir smoke
           tar -C smoke -xzf "$ASSET"
           (cd smoke && timeout 90 xvfb-run -a ./pdf-master-suite --smoke-test --require-pdf-library)
