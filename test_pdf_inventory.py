@@ -248,8 +248,8 @@ class PortableModeTest(unittest.TestCase):
                     mock.patch.object(inv.sys, "executable", str(executable)):
                 self.assertEqual(inv.program_dir(), Path(directory).resolve())
 
-    def test_version_is_mvp_1_0_0(self):
-        self.assertEqual(inv.APP_VERSION, "MVP 1.0.0")
+    def test_version_is_mvp_1_0_1(self):
+        self.assertEqual(inv.APP_VERSION, "MVP 1.0.1")
         for lang in ("en", "tr"):
             self.assertIn("{version}", inv.TRANSLATIONS[lang]["about_version"])
 
@@ -611,6 +611,39 @@ class FilenameCleanerTest(unittest.TestCase):
             self.assertEqual(outcomes[0].status, "renamed")
             self.assertIsInstance(error, OSError)
             self.assertIn("Book (Z-Library).pdf", logs.output[0])
+
+
+class SmokeTestFlagTest(unittest.TestCase):
+    """The release workflow launches each built program with --smoke-test and checks the exit code."""
+
+    def setUp(self):
+        self.data_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.data_dir, ignore_errors=True))
+        for patcher in (mock.patch.object(inv, "app_data_dir", lambda: self.data_dir),
+                        mock.patch.object(inv, "SMOKE_TEST_MS", 50)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        try:
+            tk.Tk().destroy()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk is not available: {exc}")
+
+    def test_a_healthy_start_exits_with_zero(self):
+        self.assertEqual(inv.run_smoke_test(require_pdf_library=False), 0)
+
+    def test_a_missing_pdf_library_is_reported_only_when_required(self):
+        with mock.patch.object(inv, "PYPDF_AVAILABLE", False):
+            self.assertEqual(inv.run_smoke_test(require_pdf_library=False), 0)
+            self.assertEqual(inv.run_smoke_test(require_pdf_library=True), inv.EXIT_PDF_LIBRARY_MISSING)
+
+    def test_a_crash_while_starting_exits_with_failure(self):
+        with mock.patch.object(inv, "PDFInventoryApp", side_effect=RuntimeError("boom")),                 self.assertLogs(level="ERROR"):
+            self.assertEqual(inv.run_smoke_test(require_pdf_library=False), inv.EXIT_SMOKE_FAILED)
+
+    def test_main_passes_the_result_to_the_exit_code(self):
+        with mock.patch.object(inv.os, "_exit", side_effect=SystemExit) as leave,                 self.assertRaises(SystemExit):
+            inv.main(["--smoke-test"])
+        leave.assert_called_once_with(0)
 
 
 class AppTestCase(unittest.TestCase):

@@ -20,3 +20,6 @@ Thumbs.db
 
 # Portable app data created next to the program when it runs
 pdf_inventory_data/
+
+# Personal Claude Code notes
+CLAUDE.local.md

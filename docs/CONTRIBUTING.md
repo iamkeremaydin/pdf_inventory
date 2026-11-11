@@ -25,4 +25,4 @@ Both run in GitHub Actions for pull requests and pushes to `main`: on Windows wi
 
 ## Releasing
 
-Set `APP_VERSION` in `pdf_inventory.py`, update [RELEASE_NOTES.md](RELEASE_NOTES.md), then push a tag that matches it (version `MVP 1.0.0` → tag `v1.0.0`). The Release workflow builds Windows, macOS and Linux downloads and attaches them to a GitHub release.
+Set `APP_VERSION` in `pdf_inventory.py`, update [RELEASE_NOTES.md](RELEASE_NOTES.md), then push a tag that matches it (version `MVP 1.0.1` → tag `v1.0.1`). The Release workflow builds Windows, macOS (Apple silicon and Intel) and Linux downloads, launches each one with `--smoke-test --require-pdf-library` (the window opens, closes itself and reports the result as the exit code), and only then creates the GitHub release.

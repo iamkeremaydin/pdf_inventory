@@ -35,7 +35,7 @@ from typing import Any, Callable, Iterable, Sequence
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-APP_VERSION = "MVP 1.0.0"
+APP_VERSION = "MVP 1.0.1"
 
 
 # Keep optional PDF-library diagnostics quiet without suppressing unrelated warnings.
@@ -2591,9 +2591,49 @@ def enable_windows_dpi_awareness() -> None:
         pass
 
 
-def main() -> None:
+SMOKE_TEST_MS = 1500
+EXIT_SMOKE_FAILED = 1
+EXIT_PDF_LIBRARY_MISSING = 3
+
+
+def run_smoke_test(require_pdf_library: bool) -> int:
+    """Open the real window, let it settle, close it and return an exit code (0 = started fine).
+
+    Used by the release workflow to check that each built program launches. It scans nothing
+    and sends nothing anywhere; the result is the process exit code only.
+    """
+    root: tk.Tk | None = None
+    try:
+        root = tk.Tk()
+        app = PDFInventoryApp(root)
+        failure: list[int] = []
+
+        def finish() -> None:
+            if require_pdf_library and not PYPDF_AVAILABLE:
+                failure.append(EXIT_PDF_LIBRARY_MISSING)
+            app._on_close()
+
+        root.after(SMOKE_TEST_MS, finish)
+        root.mainloop()
+        return failure[0] if failure else 0
+    except Exception:
+        logging.getLogger(__name__).exception("Smoke test failed")
+        if root is not None:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+        return EXIT_SMOKE_FAILED
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = list(sys.argv[1:] if argv is None else argv)
     configure_logging()
     enable_windows_dpi_awareness()
+    if "--smoke-test" in args:
+        code = run_smoke_test(require_pdf_library="--require-pdf-library" in args)
+        logging.shutdown()
+        os._exit(code)
     root = tk.Tk()
     PDFInventoryApp(root)
     root.mainloop()

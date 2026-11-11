@@ -22,7 +22,7 @@ Run both before calling a change done. CI (`.github/workflows/tests.yml`) runs t
 
 ## Conventions
 
-- Every user-visible string goes into `TRANSLATIONS` in both `en` and `tr`. Turkish text follows `../../md files/Türkçe Arayüz ve İşlemsel E-posta Metinleri İçin Yerelleştirme Rehberi (Kasım 2026).md`; read it only when changing Turkish strings.
+- Every user-visible string goes into `TRANSLATIONS` in both `en` and `tr`.
 - A behavior change updates `docs/USER_GUIDE.md`. A planned iteration gets an entry in `docs/QUALITY_CYCLE.md` with reason, change, acceptance, verification, rollback and review date.
 - Add a test that fails on the old behavior for every bug fix.
 - Commit messages: one imperative sentence, no prefix (e.g. "Make the app fully portable").

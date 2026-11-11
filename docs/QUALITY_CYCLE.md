@@ -164,6 +164,21 @@ This iteration and Iteration 5 were done together at the maintainer's request. T
 - **Rollback:** Delete the release and tag; revert the iteration commit.
 - **Review date:** 2026-11-25.
 
+### Iteration 8 — release hardening (MVP 1.0.1)
+
+- **Owner:** Repository maintainer.
+- **Reason:** After the first public release: Intel Mac users had no download, built programs were never launched before publishing, and the commit history exposed a personal e-mail address.
+- **Change:**
+  - Release workflow builds `macos-x86_64` on an Intel runner next to `macos-arm64`.
+  - New `--smoke-test` flag (with `--require-pdf-library`): opens the real window, closes it itself and reports the result as the exit code. The workflow launches each shipped file this way (Xvfb on Linux), checks that the data folder appears next to the program, and creates the release only if all builds pass.
+  - Unsigned-build instructions (SmartScreen, Gatekeeper) in the README and release notes.
+  - History rewritten once to replace the personal e-mail with the GitHub no-reply address; `CLAUDE.md` lost a local path (now in the git-ignored `CLAUDE.local.md`).
+- **Acceptance:** Four downloads on the release; every smoke test passes; no personal e-mail in the history.
+- **Verification:** Unit tests for the flag; the release run on GitHub.
+- **Known limit:** Builds are still unsigned. The Intel build is untested on real hardware beyond the CI launch. Old commit SHAs may stay reachable on GitHub until GitHub purges them.
+- **Rollback:** Delete the v1.0.1 release and tag; revert the commit.
+- **Review date:** 2026-11-25.
+
 ## Filename cleaner history
 
 Before Iteration 5, the cleaner was a separate script with its own quality log (`PDF_CLEANER_QUALITY.md`, removed with the script; see the git history).

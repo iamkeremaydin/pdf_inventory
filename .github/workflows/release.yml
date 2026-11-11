@@ -1,15 +1,16 @@
 name: Release
 
-# Push a tag such as v1.0.0 to build and publish the app for Windows, macOS and Linux.
+# Push a tag such as v1.0.1 to build, smoke-test and publish the app for Windows, macOS
+# (Apple silicon and Intel) and Linux. The release is created only when every build launched.
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  create-release:
+  check-version:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -18,17 +19,9 @@ jobs:
           python-version: "3.13"
       - name: Tag must match the version in the app
         run: python -c "import os, pdf_inventory as p; tag = os.environ['GITHUB_REF_NAME'].lstrip('v'); assert p.APP_VERSION == 'MVP ' + tag, (p.APP_VERSION, tag)"
-      - name: Create the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "$GITHUB_REF_NAME"
-          --title "MVP ${GITHUB_REF_NAME#v}"
-          --notes-file docs/RELEASE_NOTES.md
-          --verify-tag
 
   build:
-    needs: create-release
+    needs: check-version
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +30,8 @@ jobs:
             label: windows-x64
           - os: macos-latest
             label: macos-arm64
+          - os: macos-15-intel
+            label: macos-x86_64
           - os: ubuntu-latest
             label: linux-x86_64
     runs-on: ${{ matrix.os }}
@@ -70,8 +65,70 @@ jobs:
           tar -C dist -czf "PDF-Master-Suite-${{ matrix.label }}.tar.gz" pdf-master-suite
           echo "ASSET=PDF-Master-Suite-${{ matrix.label }}.tar.gz" >> "$GITHUB_ENV"
 
-      - name: Upload to the release
-        shell: bash
+      # Smoke tests launch the file that will be shipped, from a fresh folder, with the real
+      # window. The app closes itself after a moment and reports the result as its exit code
+      # (0 = started, 1 = crashed, 3 = the bundled PDF library is missing). Each also checks
+      # that the app wrote its data next to itself, as the portable design promises.
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory smoke | Out-Null
+          Copy-Item "$env:ASSET" smoke/
+          $p = Start-Process -FilePath "smoke/$env:ASSET" -ArgumentList "--smoke-test", "--require-pdf-library" -PassThru
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "The app did not close itself within 90 seconds" }
+          if ($p.ExitCode -ne 0) { throw "Smoke test exit code $($p.ExitCode)" }
+          if (-not (Test-Path smoke/pdf_inventory_data/settings.json)) { throw "No data folder next to the app" }
+          "Smoke test passed"
+
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 3
+        run: |
+          mkdir smoke
+          ditto -x -k "$ASSET" smoke
+          "smoke/PDF Master Suite.app/Contents/MacOS/PDF Master Suite" --smoke-test --require-pdf-library
+          test -f smoke/pdf_inventory_data/settings.json || { echo "No data folder next to the .app"; exit 1; }
+          test ! -e "smoke/PDF Master Suite.app/Contents/MacOS/pdf_inventory_data" || { echo "Data written inside the .app"; exit 1; }
+          echo "Smoke test passed"
+
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q xvfb
+          mkdir smoke
+          tar -C smoke -xzf "$ASSET"
+          (cd smoke && timeout 90 xvfb-run -a ./pdf-master-suite --smoke-test --require-pdf-library)
+          test -f smoke/pdf_inventory_data/settings.json || { echo "No data folder next to the app"; exit 1; }
+          echo "Smoke test passed"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ matrix.label }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: release-files
+      - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --clobber
+        run: |
+          ls -l release-files
+          gh release create "$GITHUB_REF_NAME" release-files/* \
+            --title "MVP ${GITHUB_REF_NAME#v}" \
+            --notes-file docs/RELEASE_NOTES.md \
+            --verify-tag
